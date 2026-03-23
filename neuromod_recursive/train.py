@@ -75,7 +75,14 @@ def train_single_config(
         print(f"Model parameters: {format_param_count(n_params)}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
+    # Linear warmup then cosine decay
+    warmup = config.warmup_steps
+    def lr_lambda(step):
+        if step < warmup:
+            return (step + 1) / warmup
+        progress = (step - warmup) / max(1, num_steps - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Set up data source
     token_stream = None
@@ -221,7 +228,13 @@ def train_distributed(
             print(f"World size: {dist.get_world_size()}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
+    warmup = config.warmup_steps
+    def lr_lambda(step):
+        if step < warmup:
+            return (step + 1) / warmup
+        progress = (step - warmup) / max(1, num_steps - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     token_stream = None
     if fineweb_setup is not None:

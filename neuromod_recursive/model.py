@@ -53,6 +53,9 @@ class NeuroModRecursiveModel(nn.Module):
         # --- Halt combiner ---
         self.halt_combiner = HaltCombiner(config)
 
+        # --- Inter-iteration normalization (prevents activation explosion in recursive loop) ---
+        self.iter_norm = nn.LayerNorm(config.hidden_dim)
+
         # --- Output head ---
         self.output_head = OutputHead(config.hidden_dim, config.vocab_size)
 
@@ -94,16 +97,29 @@ class NeuroModRecursiveModel(nn.Module):
 
         # 4. Recursive loop
         for i in range(cfg.max_iterations):
-            # 4a. Generate modulation
+            # 4a. Normalize hidden state between iterations (prevents compounding explosion)
+            h = self.iter_norm(h)
+
+            # 4b. Generate modulation
             hidden_summary = h.mean(dim=1) if cfg.use_adaptive_modulation else None
             modulation = self.modulator(input_summary, i, hidden_summary)
 
-            # 4b. Apply synaptic depression
+            # Clamp modulation outputs to safe ranges
+            if "global_scale" in modulation:
+                modulation["global_scale"] = modulation["global_scale"].clamp(-2.0, 2.0)
+            if "global_shift" in modulation:
+                modulation["global_shift"] = modulation["global_shift"].clamp(-1.0, 1.0)
+            if "layer_scale" in modulation:
+                modulation["layer_scale"] = modulation["layer_scale"].clamp(0.1, 3.0)
+            if "layer_shift" in modulation:
+                modulation["layer_shift"] = modulation["layer_shift"].clamp(-1.0, 1.0)
+
+            # 4c. Apply synaptic depression
             if cfg.use_synaptic_depression:
                 depression_mult = self.synaptic_depression(i)
                 modulation["weight_scale"] = modulation.get("weight_scale", 1.0) * depression_mult
 
-            # 4c. Run shared blocks with modulation
+            # 4d. Run shared blocks with modulation
             for block_idx, block in enumerate(self.shared_blocks):
                 block_mod = extract_block_modulation(modulation, block_idx, cfg)
 

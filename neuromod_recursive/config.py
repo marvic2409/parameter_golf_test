@@ -47,9 +47,10 @@ class NeuroModConfig:
 
     # --- Training ---
     iteration_cost: float = 0.01
-    lr: float = 3e-4
+    lr: float = 1e-4
     batch_size: int = 32
     num_epochs: int = 20
+    warmup_steps: int = 200
 
     def count_active_halt_signals(self) -> int:
         count = 0
