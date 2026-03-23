@@ -17,6 +17,44 @@ from .modules.modulator import ModulatorNetwork, extract_block_modulation
 from .modules.oscillator import OscillatoryGating
 
 
+def _summarize_modulation(modulation: dict[str, Tensor], batch_size: int, device: torch.device) -> dict[str, Tensor]:
+    """Reduce modulation tensors to small per-sample statistics for profiling."""
+    feature_parts: list[Tensor] = []
+    if "global_scale" in modulation:
+        feature_parts.append((modulation["global_scale"] - 1.0).reshape(batch_size, -1).abs())
+    if "global_shift" in modulation:
+        feature_parts.append(modulation["global_shift"].reshape(batch_size, -1).abs())
+    if "layer_scale" in modulation:
+        feature_parts.append((modulation["layer_scale"] - 1.0).reshape(batch_size, -1).abs())
+    if "layer_shift" in modulation:
+        feature_parts.append(modulation["layer_shift"].reshape(batch_size, -1).abs())
+    if "channel_gate" in modulation:
+        feature_parts.append((modulation["channel_gate"] - 1.0).reshape(batch_size, -1).abs())
+
+    if feature_parts:
+        flat = torch.cat(feature_parts, dim=-1)
+        magnitude = flat.mean(dim=-1)
+        variance = flat.var(dim=-1, unbiased=False)
+    else:
+        magnitude = torch.zeros(batch_size, device=device)
+        variance = torch.zeros(batch_size, device=device)
+
+    if "channel_gate" in modulation:
+        gates = modulation["channel_gate"].reshape(batch_size, -1).clamp(1e-6, 1.0 - 1e-6)
+        sparsity = (gates < 0.1).float().mean(dim=-1)
+        gate_entropy = -(gates * gates.log() + (1.0 - gates) * (1.0 - gates).log()).mean(dim=-1)
+    else:
+        sparsity = torch.zeros(batch_size, device=device)
+        gate_entropy = torch.zeros(batch_size, device=device)
+
+    return {
+        "magnitude": magnitude,
+        "variance": variance,
+        "channel_gate_sparsity": sparsity,
+        "channel_gate_entropy": gate_entropy,
+    }
+
+
 class NeuroModRecursiveModel(nn.Module):
     def __init__(self, config: NeuroModConfig):
         super().__init__()
@@ -93,7 +131,6 @@ class NeuroModRecursiveModel(nn.Module):
         hidden_states = []
         halt_probs = []
         iteration_details = []
-        num_iterations_used = torch.zeros(B, device=device)
 
         # 4. Recursive loop
         for i in range(cfg.max_iterations):
@@ -118,6 +155,7 @@ class NeuroModRecursiveModel(nn.Module):
             if cfg.use_synaptic_depression:
                 depression_mult = self.synaptic_depression(i)
                 modulation["weight_scale"] = modulation.get("weight_scale", 1.0) * depression_mult
+            modulation_stats = _summarize_modulation(modulation, B, device) if return_details else None
 
             # 4d. Run shared blocks with modulation
             for block_idx, block in enumerate(self.shared_blocks):
@@ -138,6 +176,11 @@ class NeuroModRecursiveModel(nn.Module):
             if cfg.use_inhibitory_damping:
                 h, inhibition_accum = self.inhibitory_damping(h, h_prev, inhibition_accum)
 
+            delta = (h - h_prev).norm(dim=(-2, -1))
+            delta_denom = h_prev.norm(dim=(-2, -1)) + 1e-8
+            relative_delta = delta / delta_denom
+            hidden_norm = h.norm(dim=(-2, -1))
+
             # 4e. Collect halt signals
             halt_signals = {}
             if cfg.use_attractor_halt:
@@ -152,7 +195,7 @@ class NeuroModRecursiveModel(nn.Module):
                 halt_signals["energy"] = (energy <= 0).float()
 
             # 4f. Combine halt signals
-            should_halt, halt_prob = self.halt_combiner(halt_signals)
+            should_halt, halt_prob = self.halt_combiner(halt_signals, batch_size=B, device=device)
 
             # 4g. ACT bookkeeping
             # Clamp so cumulative doesn't exceed 1
@@ -162,14 +205,18 @@ class NeuroModRecursiveModel(nn.Module):
 
             hidden_states.append(h)
             halt_probs.append(used_prob)
-            num_iterations_used = num_iterations_used + 1.0
 
             if return_details:
                 iteration_details.append({
                     "halt_signals": {k: v.detach() for k, v in halt_signals.items()},
+                    "should_halt": should_halt.detach(),
                     "halt_prob": halt_prob.detach(),
+                    "used_prob": used_prob.detach(),
                     "cumulative_halt_prob": cumulative_halt_prob.detach().clone(),
                     "energy": energy.detach().clone() if cfg.use_energy_budget else None,
+                    "delta_norm": relative_delta.detach(),
+                    "hidden_norm": hidden_norm.detach(),
+                    "modulation_stats": {k: v.detach() for k, v in modulation_stats.items()} if modulation_stats else None,
                 })
 
             h_prev = h
@@ -184,29 +231,37 @@ class NeuroModRecursiveModel(nn.Module):
             # Ensure weights sum to 1 per sample
             prob_stack = torch.cat(halt_probs, dim=-1)  # (B, num_iters)
             # Add remainder to last iteration
-            remainder = 1.0 - prob_stack.sum(dim=-1, keepdim=True)
-            prob_stack = torch.cat([
+            remainder = torch.clamp_min(1.0 - prob_stack.sum(dim=-1, keepdim=True), 0.0)
+            halt_distribution = torch.cat([
                 prob_stack[:, :-1],
                 prob_stack[:, -1:] + remainder,
             ], dim=-1)
 
             # Weighted combination
             states = torch.stack(hidden_states, dim=1)  # (B, num_iters, T, D)
-            weights = prob_stack.unsqueeze(-1).unsqueeze(-1)  # (B, num_iters, 1, 1)
+            weights = halt_distribution.unsqueeze(-1).unsqueeze(-1)  # (B, num_iters, 1, 1)
             output_h = (states * weights).sum(dim=1)  # (B, T, D)
+            step_ids = torch.arange(1, halt_distribution.size(-1) + 1, device=device, dtype=halt_distribution.dtype)
+            expected_iterations = (halt_distribution * step_ids.unsqueeze(0)).sum(dim=-1)
         else:
             output_h = h
+            halt_distribution = torch.ones(B, 1, device=device, dtype=h.dtype)
+            expected_iterations = torch.ones(B, device=device, dtype=h.dtype)
 
         # 6. Output head
         logits = self.output_head(output_h)
 
         details = {
-            "num_iterations": num_iterations_used.mean().item(),
-            "halt_probs": [hp.detach() for hp in halt_probs],
-            "cumulative_halt_prob": cumulative_halt_prob.detach(),
+            "expected_iterations": expected_iterations,
+            "num_iterations": float(expected_iterations.detach().mean().item()),
+            "iterations_executed": len(hidden_states),
+            "halt_probs": halt_probs,
+            "halt_distribution": halt_distribution,
+            "cumulative_halt_prob": cumulative_halt_prob,
         }
         if return_details:
             details["iteration_details"] = iteration_details
+            details["final_hidden_summary"] = output_h.mean(dim=1).detach()
 
         return logits, details
 
@@ -224,20 +279,20 @@ def compute_loss(
     )
 
     # Ponder cost
-    ponder_cost = config.iteration_cost * details["num_iterations"]
+    ponder_cost = config.iteration_cost * details["expected_iterations"].mean()
 
     # ACT remainder loss — encourages crisp halting decisions
     act_loss = torch.tensor(0.0, device=logits.device)
     if config.use_learned_halt and details["halt_probs"]:
         probs = torch.cat(details["halt_probs"], dim=-1)  # (B, num_iters)
-        remainder = (1.0 - probs.sum(dim=-1)).abs()
+        remainder = torch.clamp_min(1.0 - probs.sum(dim=-1), 0.0)
         act_loss = remainder.mean()
 
     total_loss = task_loss + ponder_cost + 0.01 * act_loss
 
     return total_loss, {
         "task_loss": task_loss.item(),
-        "ponder_cost": ponder_cost,
+        "ponder_cost": float(ponder_cost.detach().item()),
         "act_loss": act_loss.item(),
         "total_loss": total_loss.item(),
         "avg_iterations": details["num_iterations"],

@@ -10,6 +10,7 @@ This module loads the actual FineWeb shards and computes BPB identically to trai
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
 from pathlib import Path
@@ -23,10 +24,16 @@ from torch import Tensor
 # --- Data loading (mirrors train_gpt.py) ---
 
 def load_data_shard(file: Path) -> Tensor:
-    """Load a .bin shard: 256-byte header + uint16 tokens."""
-    header_bytes = 256
-    nbytes = os.path.getsize(file)
-    num_tokens = (nbytes - header_bytes) // 2
+    """Load a .bin shard using the official 256-int32 challenge header."""
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    token_bytes = np.dtype("<u2").itemsize
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    num_tokens = int(header[2])
+    expected_size = header_bytes + num_tokens * token_bytes
+    if file.stat().st_size != expected_size:
+        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
@@ -106,6 +113,26 @@ class TokenStream:
             self.pos += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedTokenLoader:
+    """Per-rank loader that consumes one shared token stream without duplicating spans."""
+
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.stream = TokenStream(pattern)
+
+    def next_batch(self, batch_size: int, seq_len: int) -> tuple[Tensor, Tensor]:
+        local_tokens = batch_size * seq_len
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(device=self.device, dtype=torch.long)
+        x = local[:-1].reshape(batch_size, seq_len)
+        y = local[1:].reshape(batch_size, seq_len)
+        return x, y
 
 
 # --- BPB evaluation (matches train_gpt.py exactly) ---
@@ -194,6 +221,10 @@ def setup_fineweb_eval(
 
     Returns a dict with all the components needed to call eval_fineweb_bpb().
     """
+    dataset_name, actual_train_files, expected_train_files = validate_dataset_tokenizer_pair(
+        data_path=data_path,
+        tokenizer_path=tokenizer_path,
+    )
     val_pattern = os.path.join(data_path, "fineweb_val_*.bin")
     train_pattern = os.path.join(data_path, "fineweb_train_*.bin")
 
@@ -210,6 +241,9 @@ def setup_fineweb_eval(
     )
 
     return {
+        "dataset_name": dataset_name,
+        "actual_train_files": actual_train_files,
+        "expected_train_files": expected_train_files,
         "val_tokens": val_tokens,
         "train_pattern": train_pattern,
         "tokenizer": sp,
@@ -219,3 +253,41 @@ def setup_fineweb_eval(
         "has_leading_space_lut": has_leading_space_lut,
         "is_boundary_token_lut": is_boundary_token_lut,
     }
+
+
+def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
+    """Fail fast on mismatched dataset/tokenizer pairs when a manifest is available."""
+    dataset_dir = Path(data_path).resolve()
+    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
+    if len(dataset_dir.parents) < 2:
+        return dataset_dir.name, actual_train_files, None
+
+    manifest_path = dataset_dir.parents[1] / "manifest.json"
+    if not manifest_path.is_file():
+        return dataset_dir.name, actual_train_files, None
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir.name), None)
+    if dataset_entry is None:
+        return dataset_dir.name, actual_train_files, None
+
+    tokenizer_name = dataset_entry.get("tokenizer_name")
+    tokenizer_entry = (
+        next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
+        if tokenizer_name
+        else None
+    )
+    expected_name = Path((tokenizer_entry or {}).get("model_path") or (tokenizer_entry or {}).get("path") or "").name
+    if expected_name and Path(tokenizer_path).name != expected_name:
+        raise ValueError(f"{dataset_dir.name} expects tokenizer {expected_name}, got {Path(tokenizer_path).name}")
+
+    expected_train_files = (dataset_entry.get("stats") or {}).get("files_train")
+    if expected_train_files is not None:
+        expected_train_files = int(expected_train_files)
+        if actual_train_files > expected_train_files:
+            raise ValueError(
+                f"{dataset_dir.name} has more train shards than expected: found {actual_train_files}, "
+                f"manifest says {expected_train_files}"
+            )
+
+    return dataset_dir.name, actual_train_files, expected_train_files

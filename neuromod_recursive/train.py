@@ -160,6 +160,7 @@ def train_single_config(
 
     model.train()
     train_losses = []
+    iteration_means = []
     start_time = time.time()
 
     for step in range(num_steps):
@@ -190,6 +191,7 @@ def train_single_config(
         scheduler.step()
 
         train_losses.append(loss_dict["task_loss"])
+        iteration_means.append(float(loss_dict["avg_iterations"]))
 
         if not quiet and (step + 1) % log_every == 0:
             elapsed = time.time() - start_time
@@ -204,6 +206,9 @@ def train_single_config(
 
     # --- Final evaluation ---
     elapsed = time.time() - start_time
+    avg_iterations_run = (
+        sum(iteration_means) / len(iteration_means) if iteration_means else float(config.max_iterations)
+    )
 
     if fineweb_setup is not None:
         # Evaluate on actual FineWeb BPB
@@ -219,13 +224,11 @@ def train_single_config(
             batch_size=max(1, 65536 // config.seq_len),
             device=device,
         )
-        avg_iters = details.get("num_iterations", config.max_iterations) if details else config.max_iterations
-
         result = {
             "val_loss": val_loss,
             "val_bpb": val_bpb,
             "task_loss": val_loss,
-            "avg_iterations": avg_iters,
+            "avg_iterations": avg_iterations_run,
             "train_loss_final": train_losses[-1] if train_losses else float("inf"),
             "n_params": n_params,
             "elapsed_seconds": elapsed,
@@ -233,7 +236,7 @@ def train_single_config(
         }
         if not quiet:
             print(f"\n  Final: val_loss={val_loss:.4f} | val_bpb={val_bpb:.4f} | "
-                  f"avg_iters={avg_iters:.1f} | time={elapsed:.1f}s")
+                  f"avg_iters={avg_iterations_run:.1f} | time={elapsed:.1f}s")
     else:
         eval_result = evaluate_model(model, config, num_batches=eval_batches, device=device)
         result = {
@@ -303,19 +306,31 @@ def train_distributed(
 
     token_stream = None
     if fineweb_setup is not None:
-        from .fineweb_eval import TokenStream
-        token_stream = TokenStream(fineweb_setup["train_pattern"])
+        from .fineweb_eval import DistributedTokenLoader, TokenStream
+        if is_dist:
+            token_stream = DistributedTokenLoader(
+                fineweb_setup["train_pattern"],
+                rank=rank,
+                world_size=dist.get_world_size(),
+                device=device,
+            )
+        else:
+            token_stream = TokenStream(fineweb_setup["train_pattern"])
 
     model.train()
     train_losses = []
+    iteration_means = []
     start_time = time.time()
 
     for step in range(num_steps):
         if token_stream is not None:
-            total_tokens = config.batch_size * config.seq_len + 1
-            raw = token_stream.take(total_tokens).to(device=device, dtype=torch.long)
-            inputs = raw[:-1].reshape(config.batch_size, config.seq_len)
-            targets = raw[1:].reshape(config.batch_size, config.seq_len)
+            if is_dist:
+                inputs, targets = token_stream.next_batch(config.batch_size, config.seq_len)
+            else:
+                total_tokens = config.batch_size * config.seq_len + 1
+                raw = token_stream.take(total_tokens).to(device=device, dtype=torch.long)
+                inputs = raw[:-1].reshape(config.batch_size, config.seq_len)
+                targets = raw[1:].reshape(config.batch_size, config.seq_len)
         else:
             inputs, targets = generate_mixed_batch(
                 config.batch_size, config.seq_len, config.vocab_size, device=device
@@ -336,6 +351,7 @@ def train_distributed(
         scheduler.step()
 
         train_losses.append(loss_dict["task_loss"])
+        iteration_means.append(float(loss_dict["avg_iterations"]))
 
         if is_master and (step + 1) % log_every == 0:
             elapsed = time.time() - start_time
@@ -348,6 +364,9 @@ def train_distributed(
             )
 
     elapsed = time.time() - start_time
+    avg_iterations_run = (
+        sum(iteration_means) / len(iteration_means) if iteration_means else float(config.max_iterations)
+    )
 
     if is_master:
         if fineweb_setup is not None:
@@ -363,12 +382,17 @@ def train_distributed(
                 batch_size=max(1, 65536 // config.seq_len),
                 device=device,
             )
-            eval_result = {"val_loss": val_loss, "val_bpb": val_bpb, "task_loss": val_loss, "avg_iterations": 0}
+            eval_result = {
+                "val_loss": val_loss,
+                "val_bpb": val_bpb,
+                "task_loss": val_loss,
+                "avg_iterations": avg_iterations_run,
+            }
         else:
             eval_result = evaluate_model(base_model, config, num_batches=eval_batches, device=device)
             eval_result["val_bpb"] = None
     else:
-        eval_result = {"val_loss": 0, "val_bpb": None, "task_loss": 0, "avg_iterations": 0}
+        eval_result = {"val_loss": 0, "val_bpb": None, "task_loss": 0, "avg_iterations": avg_iterations_run}
 
     if is_dist:
         cleanup_distributed()

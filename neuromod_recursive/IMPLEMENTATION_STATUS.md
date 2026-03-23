@@ -175,14 +175,14 @@ bash setup_runpod.sh 10     # Downloads 10 shards
 - [ ] Generate MAP-Elites heatmaps and novelty vs quality Pareto plots
 - [ ] Ablation studies on top configs
 - [ ] Port winning architecture to train_gpt.py format for Parameter Golf submission
-- [ ] Add int8 quantization + zlib compression for 16MB artifact limit check
+- [ ] Tighten search-time artifact accounting to include code bytes in addition to compressed model bytes
 - [ ] Add attention entropy tracking to behavioral profile
 - [ ] Add modulation statistics tracking (magnitude, drift) during profiling
 - [ ] UMAP/t-SNE visualization of behavioral embedding space
 
 ### Known Issues
 - Novelty score clamped to 10.0 to prevent explosion from extreme outlier profiles
-- Behavioral profiling only captures iteration counts and halt triggers; modulation dynamics are placeholders
+- Search-time artifact accounting still measures compressed model bytes, not final submission code+model bytes
 - On CPU, each config evaluation takes ~20-70s; a full search (600 evals) would take ~6-12 hours
 
 ---

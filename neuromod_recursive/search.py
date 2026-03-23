@@ -36,7 +36,7 @@ from .utils import set_seed, config_to_dict, save_config, get_device
 
 
 def compute_composite_fitness(
-    val_loss: float,
+    score_value: float,
     avg_iterations: float,
     stability: float,
     novelty_score: float,
@@ -50,7 +50,7 @@ def compute_composite_fitness(
     w_size_penalty: float = 2.0,
     w_quant_penalty: float = 1.0,
 ) -> float:
-    quality = -val_loss
+    quality = -score_value
     efficiency = -0.1 * avg_iterations
     stability_bonus = -0.05 * stability
     active_mechanisms = config.count_active_mechanisms()
@@ -100,6 +100,7 @@ def run_evolutionary_search(
     device: Optional[torch.device] = None,
     quiet: bool = False,
     fineweb_setup: Optional[dict] = None,
+    base_config: Optional[NeuroModConfig] = None,
 ) -> MAPElitesArchive:
     """Run the full evolutionary search with MAP-Elites + speciation + novelty."""
     set_seed(seed)
@@ -109,6 +110,7 @@ def run_evolutionary_search(
 
     archive = MAPElitesArchive()
     speciation_mgr = SpeciationManager(threshold=4.0)
+    score_label = "val_bpb" if fineweb_setup is not None else "val_loss"
 
     # If using FineWeb, override vocab/seq in all configs
     fw_vocab = fineweb_setup["vocab_size"] if fineweb_setup else None
@@ -122,14 +124,15 @@ def run_evolutionary_search(
     )
 
     # --- Initialize population ---
+    seed_config = copy.deepcopy(base_config) if base_config is not None else NeuroModConfig()
     population = [
-        make_all_on_config(),
-        make_minimal_config(),
-        make_modulation_only_config(),
-        make_halting_only_config(),
+        make_all_on_config(seed_config),
+        make_minimal_config(seed_config),
+        make_modulation_only_config(seed_config),
+        make_halting_only_config(seed_config),
     ]
     while len(population) < population_size:
-        population.append(make_random_config())
+        population.append(make_random_config(seed_config))
 
     coverage_history = []
     generation_logs = []
@@ -162,7 +165,7 @@ def run_evolutionary_search(
                 fineweb_setup=fineweb_setup,
             )
             model = train_result["model"]
-            val_loss_pre = train_result["val_loss"]
+            score_pre = train_result["val_bpb"] if train_result.get("val_bpb") is not None else train_result["val_loss"]
             avg_iters = train_result["avg_iterations"]
 
             # --- Challenge constraint checks ---
@@ -178,7 +181,7 @@ def run_evolutionary_search(
             # Re-evaluate after quantization to get the actual challenge score
             if fineweb_setup is not None:
                 from .fineweb_eval import eval_fineweb_bpb
-                val_loss_post, _ = eval_fineweb_bpb(
+                val_loss_post, val_bpb_post = eval_fineweb_bpb(
                     model=model,
                     val_tokens=fineweb_setup["val_tokens"],
                     seq_len=config.seq_len,
@@ -189,13 +192,15 @@ def run_evolutionary_search(
                     batch_size=max(1, 65536 // config.seq_len),
                     device=device,
                 )
+                score_post = val_bpb_post
             else:
                 eval_post = evaluate_model(model, config, num_batches=3, device=device)
                 val_loss_post = eval_post["val_loss"]
+                score_post = val_loss_post
 
-            # Use post-quantization loss as the real score
-            val_loss = val_loss_post
-            quant_degradation = max(0.0, val_loss_post - val_loss_pre)
+            # Use the post-quantization challenge metric as the real score.
+            score_value = score_post
+            quant_degradation = max(0.0, score_post - score_pre)
 
             # Behavioral characterization (on quantized model)
             profile = compute_behavioral_profile(model, probes, probe_categories, config)
@@ -204,14 +209,14 @@ def run_evolutionary_search(
             novelty = compute_novelty(profile, archive.all_profiles, k=novelty_k)
 
             # Handle NaN losses
-            if math.isnan(val_loss) or math.isinf(val_loss):
-                val_loss = 100.0
+            if math.isnan(score_value) or math.isinf(score_value):
+                score_value = 100.0
                 avg_iters = config.max_iterations
                 quant_degradation = 10.0
 
             # Composite fitness with challenge constraints
             fitness = compute_composite_fitness(
-                val_loss, avg_iters, 0.0, novelty, config,
+                score_value, avg_iters, 0.0, novelty, config,
                 compressed_bytes=compressed_bytes,
                 quant_degradation=quant_degradation,
                 w_novelty=novelty_weight,
@@ -224,7 +229,7 @@ def run_evolutionary_search(
             species = speciation_mgr.assign_species(config)
             species.update_fitness(fitness)
 
-            results.append((config, fitness, profile, species, val_loss, novelty))
+            results.append((config, fitness, profile, species, score_value, novelty))
 
             # Free model memory
             del model
@@ -238,7 +243,7 @@ def run_evolutionary_search(
                 size_ok = "OK" if mb < 16.0 else "OVER"
                 print(
                     f"  [{idx + 1}/{len(population)}] "
-                    f"loss={val_loss:.4f} fitness={fitness:.4f} "
+                    f"{score_label}={score_value:.4f} fitness={fitness:.4f} "
                     f"novelty={novelty:.3f} iters={avg_iters:.1f} "
                     f"size={mb:.2f}MB({size_ok}) qdeg={quant_degradation:.4f} "
                     f"species={species.id} {status} "
@@ -250,7 +255,7 @@ def run_evolutionary_search(
         archive_stats = archive.stats()
         species_stats = speciation_mgr.stats()
         fitnesses = [f for _, f, _, _, _, _ in results]
-        val_losses = [vl for _, _, _, _, vl, _ in results]
+        scores = [score for _, _, _, _, score, _ in results]
         novelties = [n for _, _, _, _, _, n in results]
 
         gen_log = {
@@ -259,8 +264,9 @@ def run_evolutionary_search(
             "species": species_stats,
             "fitness_best": max(fitnesses),
             "fitness_mean": sum(fitnesses) / len(fitnesses),
-            "val_loss_best": min(val_losses),
-            "val_loss_mean": sum(val_losses) / len(val_losses),
+            "score_name": score_label,
+            "score_best": min(scores),
+            "score_mean": sum(scores) / len(scores),
             "novelty_mean": sum(novelties) / len(novelties),
             "time_seconds": gen_time,
             "novelty_weight": novelty_weight,
@@ -271,7 +277,7 @@ def run_evolutionary_search(
         if not quiet:
             print(f"\n  Gen {gen + 1} Summary:")
             print(f"    Archive coverage: {archive_stats['coverage']:.1%} ({archive_stats['num_filled']} cells)")
-            print(f"    Best fitness: {max(fitnesses):.4f} | Best val_loss: {min(val_losses):.4f}")
+            print(f"    Best fitness: {max(fitnesses):.4f} | Best {score_label}: {min(scores):.4f}")
             print(f"    Species: {species_stats['num_species']} | Novelty mean: {sum(novelties)/len(novelties):.3f}")
             print(f"    Time: {gen_time:.0f}s")
 

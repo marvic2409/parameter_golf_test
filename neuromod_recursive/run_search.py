@@ -6,13 +6,13 @@ Usage:
   python -m neuromod_recursive.run_search --smoke-test --device cpu
 
   # Single config on FineWeb (actual BPB scoring):
-  python -m neuromod_recursive.run_search --single --use-fineweb --steps 5000
+  python -m neuromod_recursive.run_search --single --use-fineweb --preset fineweb_medium --steps 5000
 
   # Full evolutionary search on FineWeb with GPU:
-  python -m neuromod_recursive.run_search --use-fineweb --population 30 --generations 20 --steps 2000
+  python -m neuromod_recursive.run_search --use-fineweb --preset fineweb_large --population 30 --generations 20 --steps 2000
 
   # Multi-GPU:
-  torchrun --standalone --nproc_per_node=4 -m neuromod_recursive.run_search --distributed --single --use-fineweb
+  torchrun --standalone --nproc_per_node=4 -m neuromod_recursive.run_search --distributed --single --use-fineweb --preset fineweb_medium
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from .config import NeuroModConfig
+from .config import NeuroModConfig, make_preset_config
 from .model import NeuroModRecursiveModel, count_parameters
 from .search import run_evolutionary_search
 from .train import train_single_config, train_distributed
@@ -42,6 +42,13 @@ def parse_args():
     parser.add_argument("--novelty-k", type=int, default=15, help="k for k-nearest novelty")
     parser.add_argument("--seed", type=int, default=42, help="Master random seed")
     parser.add_argument("--output-dir", type=str, default="search_results", help="Output directory")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="default",
+        choices=["default", "fineweb_medium", "fineweb_large"],
+        help="Base config preset before applying any explicit overrides.",
+    )
 
     # Mode
     parser.add_argument("--single", action="store_true", help="Train a single config instead of search")
@@ -58,10 +65,46 @@ def parse_args():
     parser.add_argument("--vocab-size", type=int, default=1024, help="Vocabulary size for FineWeb")
     parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length for FineWeb training")
 
+    # Base-config overrides.
+    parser.add_argument("--hidden-dim", type=int, default=None, help="Override model hidden size")
+    parser.add_argument("--num-heads", type=int, default=None, help="Override number of attention heads")
+    parser.add_argument("--ff-mult", type=float, default=None, help="Override FFN expansion multiplier")
+    parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
+    parser.add_argument("--num-shared-blocks", type=int, default=None, help="Override number of shared blocks")
+    parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive iterations")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override per-process batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Override optimizer learning rate")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="Override LR warmup steps")
+    parser.add_argument("--num-cycles", type=int, default=None, help="Override LR restart cycle count")
+    parser.add_argument("--min-lr-ratio", type=float, default=None, help="Override LR floor ratio")
+    parser.add_argument("--iteration-cost", type=float, default=None, help="Override recursive ponder cost")
+
     # Device
     parser.add_argument("--device", type=str, default=None, help="Device: cpu, cuda, cuda:0, etc.")
 
     return parser.parse_args()
+
+
+def build_base_config(args) -> NeuroModConfig:
+    config = make_preset_config(args.preset)
+    overrides = {
+        "hidden_dim": args.hidden_dim,
+        "num_heads": args.num_heads,
+        "ff_mult": args.ff_mult,
+        "mod_dim": args.mod_dim,
+        "num_shared_blocks": args.num_shared_blocks,
+        "max_iterations": args.max_iterations,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "num_cycles": args.num_cycles,
+        "min_lr_ratio": args.min_lr_ratio,
+        "iteration_cost": args.iteration_cost,
+    }
+    for name, value in overrides.items():
+        if value is not None:
+            setattr(config, name, value)
+    return config
 
 
 def main():
@@ -78,6 +121,7 @@ def main():
         device = torch.device(args.device)
     else:
         device = get_device()
+    base_config = build_base_config(args)
 
     print(f"Device: {device}")
     if torch.cuda.is_available():
@@ -99,10 +143,26 @@ def main():
         )
         print(f"  FineWeb ready: vocab={args.vocab_size}, seq_len={args.seq_len}")
 
+    preview_config = NeuroModConfig(**vars(base_config))
+    if fineweb_setup:
+        preview_config.vocab_size = fineweb_setup["vocab_size"]
+        preview_config.seq_len = fineweb_setup["seq_len"]
+    preview_model = NeuroModRecursiveModel(preview_config)
+    preview_params = count_parameters(preview_model)
+    del preview_model
+
+    print(
+        f"Base config: preset={args.preset} hidden_dim={base_config.hidden_dim} "
+        f"heads={base_config.num_heads} ff_mult={base_config.ff_mult} "
+        f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
+        f"batch_size={base_config.batch_size} lr={base_config.lr:g} "
+        f"params={format_param_count(preview_params)}"
+    )
+
     # --- Single config training ---
     if args.single:
         print("\n--- Training single default config ---")
-        config = NeuroModConfig()
+        config = NeuroModConfig(**vars(base_config))
         if fineweb_setup:
             config.vocab_size = fineweb_setup["vocab_size"]
             config.seq_len = fineweb_setup["seq_len"]
@@ -145,6 +205,7 @@ def main():
         output_dir=args.output_dir,
         device=device,
         fineweb_setup=fineweb_setup,
+        base_config=base_config,
     )
     total_time = time.time() - t0
 

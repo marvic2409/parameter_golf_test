@@ -95,12 +95,17 @@ class HaltCombiner(nn.Module):
             nn.init.constant_(self.combiner.bias, -1.0)  # start biased toward not halting
         self.num_signals = num_signals
 
-    def forward(self, halt_signals: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        halt_signals: dict[str, Tensor],
+        batch_size: int | None = None,
+        device: torch.device | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Returns (should_halt_binary, halt_probability).
         Both are (B, 1) tensors."""
         if not halt_signals:
-            B = 1
-            device = torch.device("cpu")
+            B = batch_size if batch_size is not None else 1
+            device = device if device is not None else torch.device("cpu")
             return torch.zeros(B, 1, device=device), torch.zeros(B, 1, device=device)
 
         signals = list(halt_signals.values())

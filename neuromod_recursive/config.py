@@ -102,6 +102,10 @@ CATEGORICAL_PARAMS = {
 }
 
 
+def _base_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+    return copy.deepcopy(base) if base is not None else NeuroModConfig()
+
+
 def mutate(config: NeuroModConfig) -> NeuroModConfig:
     cfg = copy.deepcopy(config)
     for param in BOOLEAN_PARAMS:
@@ -119,7 +123,7 @@ def mutate(config: NeuroModConfig) -> NeuroModConfig:
 
 
 def crossover(cfg1: NeuroModConfig, cfg2: NeuroModConfig) -> NeuroModConfig:
-    child = NeuroModConfig()
+    child = copy.deepcopy(cfg1)
     for f in fields(NeuroModConfig):
         if f.name in ("vocab_size", "hidden_dim", "num_heads", "seq_len", "ff_mult",
                        "lr", "batch_size", "num_epochs"):
@@ -131,8 +135,8 @@ def crossover(cfg1: NeuroModConfig, cfg2: NeuroModConfig) -> NeuroModConfig:
     return child
 
 
-def make_random_config() -> NeuroModConfig:
-    cfg = NeuroModConfig()
+def make_random_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+    cfg = _base_config(base)
     for param in BOOLEAN_PARAMS:
         setattr(cfg, param, random.random() < 0.5)
     for param, (lo, hi) in CONTINUOUS_PARAMS.items():
@@ -142,15 +146,15 @@ def make_random_config() -> NeuroModConfig:
     return cfg
 
 
-def make_all_on_config() -> NeuroModConfig:
-    cfg = NeuroModConfig()
+def make_all_on_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+    cfg = _base_config(base)
     for param in BOOLEAN_PARAMS:
         setattr(cfg, param, True)
     return cfg
 
 
-def make_minimal_config() -> NeuroModConfig:
-    cfg = NeuroModConfig()
+def make_minimal_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+    cfg = _base_config(base)
     for param in BOOLEAN_PARAMS:
         setattr(cfg, param, False)
     cfg.max_iterations = 4
@@ -158,8 +162,8 @@ def make_minimal_config() -> NeuroModConfig:
     return cfg
 
 
-def make_modulation_only_config() -> NeuroModConfig:
-    cfg = make_minimal_config()
+def make_modulation_only_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+    cfg = make_minimal_config(base)
     cfg.use_global_modulation = True
     cfg.use_layer_modulation = True
     cfg.use_channel_gating = True
@@ -168,10 +172,45 @@ def make_modulation_only_config() -> NeuroModConfig:
     return cfg
 
 
-def make_halting_only_config() -> NeuroModConfig:
-    cfg = make_minimal_config()
+def make_halting_only_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+    cfg = make_minimal_config(base)
     cfg.use_attractor_halt = True
     cfg.use_learned_halt = True
     cfg.use_energy_budget = True
     cfg.halt_combination = "learned"
     return cfg
+
+
+def make_preset_config(name: str) -> NeuroModConfig:
+    cfg = NeuroModConfig()
+    if name == "default":
+        return cfg
+    if name == "fineweb_medium":
+        cfg.hidden_dim = 384
+        cfg.num_heads = 6
+        cfg.ff_mult = 3.0
+        cfg.mod_dim = 32
+        cfg.num_shared_blocks = 2
+        cfg.max_iterations = 4
+        cfg.batch_size = 16
+        cfg.lr = 2e-4
+        cfg.warmup_steps = 400
+        cfg.num_cycles = 3
+        cfg.min_lr_ratio = 0.08
+        cfg.iteration_cost = 0.005
+        return cfg
+    if name == "fineweb_large":
+        cfg.hidden_dim = 512
+        cfg.num_heads = 8
+        cfg.ff_mult = 3.0
+        cfg.mod_dim = 32
+        cfg.num_shared_blocks = 2
+        cfg.max_iterations = 4
+        cfg.batch_size = 8
+        cfg.lr = 1.5e-4
+        cfg.warmup_steps = 500
+        cfg.num_cycles = 3
+        cfg.min_lr_ratio = 0.08
+        cfg.iteration_cost = 0.005
+        return cfg
+    raise ValueError(f"unknown preset {name!r}")

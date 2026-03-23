@@ -85,40 +85,48 @@ def generate_diagnostic_probes(
 
     Returns (probe_inputs, probe_categories) where categories describe difficulty.
     """
+    if num_probes <= 0:
+        empty = torch.empty((0, seq_len), dtype=torch.long, device=device)
+        return empty, []
+
     probes = []
     categories = []
 
-    # 1. Uniform random (100)
-    n = min(100, num_probes // 5)
-    for _ in range(n):
+    num_categories = 5
+    base_n = num_probes // num_categories
+    remainder = num_probes % num_categories
+    counts = [base_n + (1 if idx < remainder else 0) for idx in range(num_categories)]
+
+    # 1. Uniform random
+    for _ in range(counts[0]):
         seq = [random.randint(1, vocab_size - 1) for _ in range(seq_len)]
         probes.append(seq)
         categories.append("random")
 
-    # 2. Deep nesting (100) — high recursion demand
-    for _ in range(n):
+    # 2. Deep nesting — high recursion demand
+    for _ in range(counts[1]):
         depth = random.randint(8, min(seq_len // 2, 20))
         seq = _make_nested_seq(seq_len, vocab_size, depth)
         probes.append(seq)
         categories.append("hard")
 
-    # 3. Shallow nesting (100) — low recursion demand
-    for _ in range(n):
+    # 3. Shallow nesting — low recursion demand
+    for _ in range(counts[2]):
         depth = random.randint(1, 3)
         seq = _make_nested_seq(seq_len, vocab_size, depth)
         probes.append(seq)
         categories.append("easy")
 
-    # 4. Repetitive patterns (100)
-    for _ in range(n):
+    # 4. Repetitive patterns
+    for _ in range(counts[3]):
         period = random.randint(2, 5)
         base = [random.randint(1, min(vocab_size - 1, 50)) for _ in range(period)]
         seq = [base[i % period] for i in range(seq_len)]
         probes.append(seq)
         categories.append("medium")
 
-    # 5. Adversarial: oscillating sequences (100)
-    for _ in range(n):
+    # 5. Adversarial: oscillating sequences
+    for _ in range(counts[4]):
         a = random.randint(1, min(vocab_size - 1, 50))
         b = random.randint(1, min(vocab_size - 1, 50))
         noise_rate = 0.1
@@ -164,35 +172,80 @@ def compute_behavioral_profile(
     probes = probes.to(device)
     profile = BehavioralProfile()
 
+    if len(probes) == 0:
+        return profile
+
     batch_size = min(64, len(probes))
     all_iterations = []
     all_halt_triggers: dict[str, list[float]] = {}
-    all_halt_timing: list[list[float]] = []
     all_mod_magnitudes = []
+    all_mod_variances = []
+    all_mod_drifts = []
+    all_gate_sparsities = []
+    all_gate_entropies = []
     all_residual_norms: list[list[float]] = []
     all_confidences = []
     all_top1 = []
     all_convergence_rates = []
+    all_hidden_summaries: list[Tensor] = []
+    halt_timing_sum = np.zeros(config.max_iterations, dtype=np.float64)
+    halt_timing_count = 0.0
 
     for start in range(0, len(probes), batch_size):
         batch = probes[start:start + batch_size]
         logits, details = model(batch, return_details=True)
 
         # Iteration count
-        n_iters = len(details.get("iteration_details", []))
-        if n_iters == 0:
-            n_iters = int(details.get("num_iterations", config.max_iterations))
-        all_iterations.extend([n_iters] * len(batch))
+        expected_iterations = details.get("expected_iterations")
+        if isinstance(expected_iterations, torch.Tensor):
+            all_iterations.extend(expected_iterations.detach().cpu().tolist())
+        else:
+            n_iters = float(details.get("num_iterations", config.max_iterations))
+            all_iterations.extend([n_iters] * len(batch))
+
+        halt_distribution = details.get("halt_distribution")
+        if isinstance(halt_distribution, torch.Tensor):
+            halt_distribution = halt_distribution.detach().cpu().numpy()
+            width = min(halt_distribution.shape[1], config.max_iterations)
+            halt_timing_sum[:width] += halt_distribution[:, :width].sum(axis=0)
+            halt_timing_count += halt_distribution.shape[0]
 
         # Halt triggers
         if "iteration_details" in details:
-            for iter_detail in details["iteration_details"]:
+            batch_mod_magnitudes = []
+            for iter_idx, iter_detail in enumerate(details["iteration_details"]):
                 for name, signal in iter_detail.get("halt_signals", {}).items():
                     if name not in all_halt_triggers:
                         all_halt_triggers[name] = []
                     all_halt_triggers[name].append(
                         (signal > 0.5).float().mean().item()
                     )
+                mod_stats = iter_detail.get("modulation_stats")
+                if mod_stats is not None:
+                    mag = mod_stats["magnitude"].cpu().numpy()
+                    var = mod_stats["variance"].cpu().numpy()
+                    sparse = mod_stats["channel_gate_sparsity"].cpu().numpy()
+                    ent = mod_stats["channel_gate_entropy"].cpu().numpy()
+                    all_mod_magnitudes.extend(mag.tolist())
+                    all_mod_variances.extend(var.tolist())
+                    all_gate_sparsities.extend(sparse.tolist())
+                    all_gate_entropies.extend(ent.tolist())
+                    batch_mod_magnitudes.append(mag)
+                delta_norm = iter_detail.get("delta_norm")
+                if isinstance(delta_norm, torch.Tensor):
+                    all_convergence_rates.extend(delta_norm.cpu().tolist())
+                hidden_norm = iter_detail.get("hidden_norm")
+                if isinstance(hidden_norm, torch.Tensor):
+                    while len(all_residual_norms) <= iter_idx:
+                        all_residual_norms.append([])
+                    all_residual_norms[iter_idx].extend(hidden_norm.cpu().tolist())
+            if len(batch_mod_magnitudes) >= 2:
+                stacked = np.stack(batch_mod_magnitudes, axis=1)
+                all_mod_drifts.extend(np.abs(np.diff(stacked, axis=1)).mean(axis=1).tolist())
+
+        hidden_summary = details.get("final_hidden_summary")
+        if isinstance(hidden_summary, torch.Tensor):
+            all_hidden_summaries.append(hidden_summary.cpu())
 
         # Confidence
         probs = torch.softmax(logits, dim=-1)
@@ -218,7 +271,12 @@ def compute_behavioral_profile(
     ]
 
     # Iteration entropy
-    counts = np.bincount(np.array(all_iterations, dtype=np.int64), minlength=config.max_iterations + 1)
+    iter_bins = np.clip(
+        np.rint(np.array(all_iterations, dtype=np.float32)).astype(np.int64),
+        1,
+        config.max_iterations,
+    )
+    counts = np.bincount(iter_bins, minlength=config.max_iterations + 1)
     counts = counts.astype(np.float64)
     p = counts / (counts.sum() + 1e-8)
     p = p[p > 0]
@@ -231,27 +289,33 @@ def compute_behavioral_profile(
 
     # Confidence and diversity
     profile.confidence_profile = float(np.mean(all_confidences))
-    profile.output_diversity = float(len(set(all_top1)))
+    profile.output_diversity = float(len(set(all_top1)) / max(len(all_top1), 1))
 
     # Halt timing (which iteration halt fires)
-    timing = np.zeros(config.max_iterations)
-    if all_iterations:
-        for it in all_iterations:
-            if 0 < it <= config.max_iterations:
-                timing[it - 1] += 1
-        timing = timing / (len(all_iterations) + 1e-8)
-    profile.halt_timing_profile = timing.tolist()
+    if halt_timing_count > 0:
+        profile.halt_timing_profile = (halt_timing_sum / halt_timing_count).tolist()
+    else:
+        profile.halt_timing_profile = [0.0] * config.max_iterations
 
-    # Placeholder for modulation and convergence metrics
-    # These would require per-iteration hidden state tracking
-    profile.modulation_magnitude = 0.0
-    profile.modulation_variance = 0.0
-    profile.modulation_iteration_drift = 0.0
-    profile.channel_gate_sparsity = 0.0
-    profile.channel_gate_entropy = 0.0
-    profile.convergence_rate = 0.0
-    profile.hidden_state_rank = 0.0
-    profile.residual_stream_norm_profile = [0.0] * config.max_iterations
+    profile.modulation_magnitude = float(np.mean(all_mod_magnitudes)) if all_mod_magnitudes else 0.0
+    profile.modulation_variance = float(np.mean(all_mod_variances)) if all_mod_variances else 0.0
+    profile.modulation_iteration_drift = float(np.mean(all_mod_drifts)) if all_mod_drifts else 0.0
+    profile.channel_gate_sparsity = float(np.mean(all_gate_sparsities)) if all_gate_sparsities else 0.0
+    profile.channel_gate_entropy = float(np.mean(all_gate_entropies)) if all_gate_entropies else 0.0
+    profile.convergence_rate = float(np.mean(all_convergence_rates)) if all_convergence_rates else 0.0
+    profile.residual_stream_norm_profile = [
+        float(np.mean(vals)) if vals else 0.0 for vals in all_residual_norms[: config.max_iterations]
+    ]
+    if len(profile.residual_stream_norm_profile) < config.max_iterations:
+        profile.residual_stream_norm_profile.extend([0.0] * (config.max_iterations - len(profile.residual_stream_norm_profile)))
+
+    if all_hidden_summaries:
+        hidden = torch.cat(all_hidden_summaries, dim=0).float().numpy()
+        hidden = hidden - hidden.mean(axis=0, keepdims=True)
+        if hidden.shape[0] > 1 and np.any(hidden):
+            singular_values = np.linalg.svd(hidden, compute_uv=False)
+            spectral_norm_sq = float((singular_values[0] ** 2) + 1e-8)
+            profile.hidden_state_rank = float((singular_values ** 2).sum() / spectral_norm_sq)
 
     model.train()
     return profile
