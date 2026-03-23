@@ -1,9 +1,14 @@
-"""Evolutionary search harness — MAP-Elites + Speciation + Novelty-driven search."""
+"""Evolutionary search harness — MAP-Elites + Speciation + Novelty-driven search.
+
+Every architecture is evaluated AFTER int8 quantization + zlib compression to ensure
+it remains viable under the Parameter Golf challenge constraints (16MB artifact, BPB scoring).
+"""
 
 from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import random
 import time
@@ -17,6 +22,7 @@ from .config import (
     make_modulation_only_config, make_halting_only_config,
     make_random_config, BOOLEAN_PARAMS,
 )
+from .compression import measure_compressed_size, quantize_state_dict_int8, dequantize_state_dict_int8
 from .model import NeuroModRecursiveModel, count_parameters
 from .train import train_single_config
 from .evaluate import evaluate_model
@@ -35,10 +41,14 @@ def compute_composite_fitness(
     stability: float,
     novelty_score: float,
     config: NeuroModConfig,
+    compressed_bytes: int = 0,
+    quant_degradation: float = 0.0,
     w_quality: float = 1.0,
     w_novelty: float = 0.5,
     w_efficiency: float = 0.1,
     w_simplicity: float = 0.05,
+    w_size_penalty: float = 2.0,
+    w_quant_penalty: float = 1.0,
 ) -> float:
     quality = -val_loss
     efficiency = -0.1 * avg_iterations
@@ -46,12 +56,26 @@ def compute_composite_fitness(
     active_mechanisms = config.count_active_mechanisms()
     simplicity = -active_mechanisms
 
+    # Size penalty: harsh penalty for exceeding 16MB, gentle pressure otherwise
+    size_penalty = 0.0
+    if compressed_bytes > 0:
+        mb = compressed_bytes / 1_000_000
+        if mb > 16.0:
+            size_penalty = -w_size_penalty * (mb - 16.0)  # big penalty per MB over
+        else:
+            size_penalty = -0.01 * mb  # gentle pressure to be smaller
+
+    # Quantization degradation penalty: penalize architectures that break after int8
+    quant_penalty = -w_quant_penalty * quant_degradation
+
     return (
         w_quality * quality
         + w_novelty * novelty_score
         + w_efficiency * efficiency
         + w_simplicity * simplicity
         + stability_bonus
+        + size_penalty
+        + quant_penalty
     )
 
 
@@ -138,24 +162,58 @@ def run_evolutionary_search(
                 fineweb_setup=fineweb_setup,
             )
             model = train_result["model"]
-            val_loss = train_result["val_loss"]
+            val_loss_pre = train_result["val_loss"]
             avg_iters = train_result["avg_iterations"]
 
-            # Behavioral characterization
+            # --- Challenge constraint checks ---
+            # 1. Measure compressed size
+            size_stats = measure_compressed_size(model)
+            compressed_bytes = size_stats["zlib_compressed_bytes"]
+
+            # 2. Quantization roundtrip: evaluate AFTER int8 quantize+dequantize
+            quant_obj, _ = quantize_state_dict_int8(model.state_dict())
+            dequant_state = dequantize_state_dict_int8(quant_obj)
+            model.load_state_dict(dequant_state)
+
+            # Re-evaluate after quantization to get the actual challenge score
+            if fineweb_setup is not None:
+                from .fineweb_eval import eval_fineweb_bpb
+                val_loss_post, _ = eval_fineweb_bpb(
+                    model=model,
+                    val_tokens=fineweb_setup["val_tokens"],
+                    seq_len=config.seq_len,
+                    vocab_size=config.vocab_size,
+                    base_bytes_lut=fineweb_setup["base_bytes_lut"].to(device),
+                    has_leading_space_lut=fineweb_setup["has_leading_space_lut"].to(device),
+                    is_boundary_token_lut=fineweb_setup["is_boundary_token_lut"].to(device),
+                    batch_size=max(1, 65536 // config.seq_len),
+                    device=device,
+                )
+            else:
+                eval_post = evaluate_model(model, config, num_batches=3, device=device)
+                val_loss_post = eval_post["val_loss"]
+
+            # Use post-quantization loss as the real score
+            val_loss = val_loss_post
+            quant_degradation = max(0.0, val_loss_post - val_loss_pre)
+
+            # Behavioral characterization (on quantized model)
             profile = compute_behavioral_profile(model, probes, probe_categories, config)
 
             # Novelty score
             novelty = compute_novelty(profile, archive.all_profiles, k=novelty_k)
 
             # Handle NaN losses
-            import math
             if math.isnan(val_loss) or math.isinf(val_loss):
-                val_loss = 100.0  # penalty for diverged training
+                val_loss = 100.0
                 avg_iters = config.max_iterations
+                quant_degradation = 10.0
 
-            # Composite fitness (stability=0 for speed; compute_stability is expensive)
+            # Composite fitness with challenge constraints
             fitness = compute_composite_fitness(
                 val_loss, avg_iters, 0.0, novelty, config,
+                compressed_bytes=compressed_bytes,
+                quant_degradation=quant_degradation,
                 w_novelty=novelty_weight,
             )
 
@@ -176,10 +234,13 @@ def run_evolutionary_search(
             eval_time = time.time() - eval_start
             if not quiet:
                 status = "NEW_NICHE" if is_new else ""
+                mb = compressed_bytes / 1_000_000
+                size_ok = "OK" if mb < 16.0 else "OVER"
                 print(
                     f"  [{idx + 1}/{len(population)}] "
                     f"loss={val_loss:.4f} fitness={fitness:.4f} "
                     f"novelty={novelty:.3f} iters={avg_iters:.1f} "
+                    f"size={mb:.2f}MB({size_ok}) qdeg={quant_degradation:.4f} "
                     f"species={species.id} {status} "
                     f"({eval_time:.1f}s)"
                 )
