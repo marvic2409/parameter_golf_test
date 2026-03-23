@@ -61,7 +61,33 @@ def sync_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def timed_eval(model, config: NeuroModConfig, fineweb_setup, device: torch.device) -> tuple[float, float]:
+def safe_rate(count: float, seconds: float) -> float:
+    if seconds <= 0.0:
+        return 0.0
+    return count / seconds
+
+
+def eval_workload_size(
+    config: NeuroModConfig,
+    fineweb_setup,
+    synthetic_eval_batches: int,
+) -> tuple[int, int]:
+    if fineweb_setup is not None:
+        token_count = int(fineweb_setup["val_tokens"].numel() - 1)
+        seq_count = token_count // config.seq_len
+        return token_count, seq_count
+    seq_count = synthetic_eval_batches * config.batch_size
+    token_count = seq_count * config.seq_len
+    return token_count, seq_count
+
+
+def timed_eval(
+    model,
+    config: NeuroModConfig,
+    fineweb_setup,
+    device: torch.device,
+    synthetic_eval_batches: int = 5,
+) -> tuple[float, float, int, int]:
     sync_device(device)
     t0 = time.perf_counter()
     if fineweb_setup is not None:
@@ -80,11 +106,12 @@ def timed_eval(model, config: NeuroModConfig, fineweb_setup, device: torch.devic
         )
         score = val_bpb
     else:
-        eval_result = evaluate_model(model, config, num_batches=5, device=device)
+        eval_result = evaluate_model(model, config, num_batches=synthetic_eval_batches, device=device)
         val_loss = eval_result["val_loss"]
         score = val_loss
     sync_device(device)
-    return score, time.perf_counter() - t0
+    token_count, seq_count = eval_workload_size(config, fineweb_setup, synthetic_eval_batches)
+    return score, time.perf_counter() - t0, token_count, seq_count
 
 
 def main() -> None:
@@ -132,7 +159,14 @@ def main() -> None:
 
     # Re-time the same eval once so we can estimate and subtract the fixed eval cost
     # already included inside train_single_config().
-    prequant_score_recheck, prequant_eval_s = timed_eval(model, config, fineweb_setup, device)
+    synthetic_eval_batches = 5
+    prequant_score_recheck, prequant_eval_s, eval_tokens, eval_sequences = timed_eval(
+        model,
+        config,
+        fineweb_setup,
+        device,
+        synthetic_eval_batches=synthetic_eval_batches,
+    )
 
     sync_device(device)
     t_comp0 = time.perf_counter()
@@ -148,7 +182,13 @@ def main() -> None:
     sync_device(device)
     quant_reload_s = time.perf_counter() - t_quant0
 
-    post_quant_score, post_quant_eval_s = timed_eval(model, config, fineweb_setup, device)
+    post_quant_score, post_quant_eval_s, _, _ = timed_eval(
+        model,
+        config,
+        fineweb_setup,
+        device,
+        synthetic_eval_batches=synthetic_eval_batches,
+    )
 
     probe_vocab = config.vocab_size
     probe_seq = min(config.seq_len, 64)
@@ -167,9 +207,19 @@ def main() -> None:
     train_only_s = max(train_plus_eval_s - prequant_eval_s, 0.0)
     train_s_per_step = train_only_s / max(args.steps, 1)
     scaled_profile_s = profile_s * (args.target_probes / max(args.num_probes, 1))
+    train_sequences = args.steps * config.batch_size
+    train_tokens = train_sequences * config.seq_len
+    train_token_passes = train_tokens * train_result["avg_iterations"]
+    profile_tokens = args.num_probes * probe_seq
+    scaled_profile_tokens = args.target_probes * probe_seq
+    estimated_train_s = train_s_per_step * args.search_steps
+    estimated_train_tokens = args.search_steps * config.batch_size * config.seq_len
+    estimated_train_token_passes = estimated_train_tokens * train_result["avg_iterations"]
+    estimated_candidate_tokens = estimated_train_tokens + 2 * eval_tokens + scaled_profile_tokens
+    estimated_eval_seconds = prequant_eval_s + post_quant_eval_s
 
     estimated_candidate_s = (
-        train_s_per_step * args.search_steps
+        estimated_train_s
         + prequant_eval_s
         + compression_s
         + quant_reload_s
@@ -177,6 +227,17 @@ def main() -> None:
         + scaled_profile_s
     )
     estimated_search_hours = estimated_candidate_s * args.population * args.generations / 3600.0
+
+    train_tokens_per_second = safe_rate(train_tokens, train_only_s)
+    train_sequences_per_second = safe_rate(train_sequences, train_only_s)
+    train_token_passes_per_second = safe_rate(train_token_passes, train_only_s)
+    prequant_eval_tokens_per_second = safe_rate(eval_tokens, prequant_eval_s)
+    prequant_eval_sequences_per_second = safe_rate(eval_sequences, prequant_eval_s)
+    post_quant_eval_tokens_per_second = safe_rate(eval_tokens, post_quant_eval_s)
+    post_quant_eval_sequences_per_second = safe_rate(eval_sequences, post_quant_eval_s)
+    profile_tokens_per_second = safe_rate(profile_tokens, profile_s)
+    profile_sequences_per_second = safe_rate(args.num_probes, profile_s)
+    estimated_candidate_tokens_per_second = safe_rate(estimated_candidate_tokens, estimated_candidate_s)
 
     summary = {
         "preset": args.preset,
@@ -193,21 +254,58 @@ def main() -> None:
         "prequant_eval_seconds": prequant_eval_s,
         "estimated_train_only_seconds": train_only_s,
         "train_seconds_per_step": train_s_per_step,
+        "train_sequences": train_sequences,
+        "train_tokens": train_tokens,
+        "train_token_passes": train_token_passes,
+        "train_sequences_per_second": train_sequences_per_second,
+        "train_tokens_per_second": train_tokens_per_second,
+        "train_token_passes_per_second": train_token_passes_per_second,
         "compression_seconds": compression_s,
         "quant_reload_seconds": quant_reload_s,
+        "eval_sequences": eval_sequences,
+        "eval_tokens": eval_tokens,
+        "prequant_eval_sequences_per_second": prequant_eval_sequences_per_second,
+        "prequant_eval_tokens_per_second": prequant_eval_tokens_per_second,
         "post_quant_eval_seconds": post_quant_eval_s,
+        "post_quant_eval_sequences_per_second": post_quant_eval_sequences_per_second,
+        "post_quant_eval_tokens_per_second": post_quant_eval_tokens_per_second,
         "profile_seconds": profile_s,
+        "profile_probe_seq_len": probe_seq,
+        "profile_probe_tokens": profile_tokens,
+        "profile_sequences_per_second": profile_sequences_per_second,
+        "profile_tokens_per_second": profile_tokens_per_second,
         "scaled_profile_seconds": scaled_profile_s,
+        "scaled_profile_tokens": scaled_profile_tokens,
         "prequant_score": prequant_score,
         "prequant_score_recheck": prequant_score_recheck,
         "post_quant_score": post_quant_score,
         "avg_iterations": train_result["avg_iterations"],
         "compressed_model_bytes": size_stats["zlib_compressed_bytes"],
+        "estimated_train_seconds_at_search_steps": estimated_train_s,
+        "estimated_train_tokens_at_search_steps": estimated_train_tokens,
+        "estimated_train_token_passes_at_search_steps": estimated_train_token_passes,
+        "estimated_eval_seconds_per_candidate": estimated_eval_seconds,
+        "estimated_candidate_tokens": estimated_candidate_tokens,
+        "estimated_candidate_tokens_per_second": estimated_candidate_tokens_per_second,
         "estimated_candidate_seconds_at_search_steps": estimated_candidate_s,
         "estimated_total_search_hours": estimated_search_hours,
         "profile_mean_iterations": profile.mean_iterations,
         "profile_iteration_variance": profile.iteration_variance,
     }
+
+    print(
+        f"Train throughput: {train_tokens_per_second:,.0f} tok/s "
+        f"({train_sequences_per_second:,.1f} seq/s, "
+        f"{train_token_passes_per_second:,.0f} token-passes/s)"
+    )
+    print(
+        f"Eval throughput: pre={prequant_eval_tokens_per_second:,.0f} tok/s "
+        f"post={post_quant_eval_tokens_per_second:,.0f} tok/s"
+    )
+    print(
+        f"Profile throughput: {profile_tokens_per_second:,.0f} tok/s "
+        f"({profile_sequences_per_second:,.1f} probe seq/s)"
+    )
 
     print(json.dumps(summary, indent=2, sort_keys=True))
 
