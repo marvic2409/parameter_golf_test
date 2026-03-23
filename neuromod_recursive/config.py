@@ -51,6 +51,8 @@ class NeuroModConfig:
     batch_size: int = 32
     num_epochs: int = 20
     warmup_steps: int = 200
+    num_cycles: int = 4          # number of LR spike/decay cycles (warm restarts)
+    min_lr_ratio: float = 0.05   # LR floor as fraction of peak (never fully stops learning)
 
     def count_active_halt_signals(self) -> int:
         count = 0

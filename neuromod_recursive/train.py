@@ -26,6 +26,78 @@ from .model import NeuroModRecursiveModel, compute_loss, count_parameters
 from .utils import set_seed, get_device, format_param_count
 
 
+def _make_cyclical_lr(
+    total_steps: int,
+    warmup_steps: int = 200,
+    num_cycles: int = 4,
+    min_lr_ratio: float = 0.05,
+):
+    r"""Cyclical cosine LR with warm restarts -- learning/consolidation oscillations.
+
+    Each cycle:
+      1. Spike LR back to peak (warm restart)
+      2. Cosine decay down to min_lr_ratio * peak
+
+    Cycles get progressively longer (T_mult=1.5), so early cycles are fast
+    exploration and later cycles are longer consolidation.
+
+    Looks like:
+      LR  ^
+          |  /\      /\          /\
+          | /  \    /  \        /  \
+          |/    \  /    \      /    \____
+          |      \/      \    /
+          |               \  /
+          +----------------------------> steps
+          warmup  cycle1  cycle2  cycle3
+    """
+    t_mult = 1.5  # each cycle 1.5x longer than the last
+
+    # Compute cycle boundaries
+    remaining = total_steps - warmup_steps
+    if remaining <= 0 or num_cycles <= 0:
+        # Fall back to simple warmup + cosine decay
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return lr_lambda
+
+    # Geometric series: first_len * (1 + t_mult + t_mult^2 + ... + t_mult^(n-1)) = remaining
+    geo_sum = sum(t_mult ** i for i in range(num_cycles))
+    first_cycle_len = remaining / geo_sum
+    cycle_lengths = [int(first_cycle_len * t_mult ** i) for i in range(num_cycles)]
+    # Fix rounding so they sum to remaining
+    cycle_lengths[-1] = remaining - sum(cycle_lengths[:-1])
+
+    # Build boundaries
+    cycle_starts = [warmup_steps]
+    for length in cycle_lengths[:-1]:
+        cycle_starts.append(cycle_starts[-1] + length)
+
+    def lr_lambda(step):
+        # Warmup phase
+        if step < warmup_steps:
+            return (step + 1) / max(1, warmup_steps)
+
+        # Find which cycle we're in
+        cycle_idx = 0
+        for i in range(len(cycle_starts) - 1, -1, -1):
+            if step >= cycle_starts[i]:
+                cycle_idx = i
+                break
+
+        cycle_start = cycle_starts[cycle_idx]
+        cycle_len = cycle_lengths[cycle_idx]
+        progress = (step - cycle_start) / max(1, cycle_len)
+        progress = min(progress, 1.0)
+
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return lr_lambda
+
+
 def setup_distributed():
     """Initialize DDP if running in distributed mode."""
     if "RANK" in os.environ:
@@ -75,14 +147,10 @@ def train_single_config(
         print(f"Model parameters: {format_param_count(n_params)}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
-    # Linear warmup then cosine decay
-    warmup = config.warmup_steps
-    def lr_lambda(step):
-        if step < warmup:
-            return (step + 1) / warmup
-        progress = (step - warmup) / max(1, num_steps - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        _make_cyclical_lr(num_steps, config.warmup_steps, config.num_cycles, config.min_lr_ratio),
+    )
 
     # Set up data source
     token_stream = None
@@ -228,13 +296,10 @@ def train_distributed(
             print(f"World size: {dist.get_world_size()}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
-    warmup = config.warmup_steps
-    def lr_lambda(step):
-        if step < warmup:
-            return (step + 1) / warmup
-        progress = (step - warmup) / max(1, num_steps - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        _make_cyclical_lr(num_steps, config.warmup_steps, config.num_cycles, config.min_lr_ratio),
+    )
 
     token_stream = None
     if fineweb_setup is not None:
