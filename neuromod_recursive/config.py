@@ -87,6 +87,17 @@ BOOLEAN_PARAMS = [
     "use_energy_budget", "use_inhibitory_damping",
 ]
 
+MODULATION_BOOLEAN_PARAMS = [
+    "use_global_modulation", "use_layer_modulation", "use_channel_gating",
+    "use_iteration_encoding", "use_adaptive_modulation",
+]
+
+HALTING_BOOLEAN_PARAMS = [
+    "use_attractor_halt", "use_learned_halt", "use_modulator_halt",
+    "use_synaptic_depression", "use_oscillatory_gating",
+    "use_energy_budget", "use_inhibitory_damping",
+]
+
 CONTINUOUS_PARAMS = {
     "attractor_threshold": (0.001, 0.1),
     "depression_rate": (0.01, 0.2),
@@ -101,22 +112,54 @@ CATEGORICAL_PARAMS = {
     "num_shared_blocks": [1, 2, 3],
 }
 
+SEARCH_SPACE_SPECS = {
+    "all": {
+        "boolean": list(BOOLEAN_PARAMS),
+        "continuous": list(CONTINUOUS_PARAMS.keys()),
+        "categorical": list(CATEGORICAL_PARAMS.keys()),
+    },
+    "motif_only": {
+        "boolean": list(BOOLEAN_PARAMS),
+        "continuous": ["iteration_cost"],
+        "categorical": ["halt_combination", "mod_dim", "max_iterations", "num_shared_blocks"],
+    },
+    "modulation_only": {
+        "boolean": list(MODULATION_BOOLEAN_PARAMS),
+        "continuous": [],
+        "categorical": ["mod_dim", "max_iterations", "num_shared_blocks"],
+    },
+    "halting_only": {
+        "boolean": list(HALTING_BOOLEAN_PARAMS),
+        "continuous": ["attractor_threshold", "depression_rate", "energy_budget", "iteration_cost"],
+        "categorical": ["halt_combination", "max_iterations", "num_shared_blocks"],
+    },
+}
+
 
 def _base_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
     return copy.deepcopy(base) if base is not None else NeuroModConfig()
 
 
-def mutate(config: NeuroModConfig) -> NeuroModConfig:
+def get_search_space_spec(search_space: str = "all") -> dict[str, list[str]]:
+    if search_space not in SEARCH_SPACE_SPECS:
+        raise ValueError(f"Unknown search space: {search_space}")
+    return SEARCH_SPACE_SPECS[search_space]
+
+
+def mutate(config: NeuroModConfig, search_space: str = "all") -> NeuroModConfig:
     cfg = copy.deepcopy(config)
-    for param in BOOLEAN_PARAMS:
+    spec = get_search_space_spec(search_space)
+    for param in spec["boolean"]:
         if random.random() < 0.15:
             setattr(cfg, param, not getattr(cfg, param))
-    for param, (lo, hi) in CONTINUOUS_PARAMS.items():
+    for param in spec["continuous"]:
+        lo, hi = CONTINUOUS_PARAMS[param]
         if random.random() < 0.20:
             val = getattr(cfg, param)
             noise = random.gauss(0, 0.1 * (hi - lo))
             setattr(cfg, param, max(lo, min(hi, val + noise)))
-    for param, choices in CATEGORICAL_PARAMS.items():
+    for param in spec["categorical"]:
+        choices = CATEGORICAL_PARAMS[param]
         if random.random() < 0.10:
             setattr(cfg, param, random.choice(choices))
     return cfg
@@ -135,49 +178,57 @@ def crossover(cfg1: NeuroModConfig, cfg2: NeuroModConfig) -> NeuroModConfig:
     return child
 
 
-def make_random_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+def make_random_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
     cfg = _base_config(base)
-    for param in BOOLEAN_PARAMS:
+    spec = get_search_space_spec(search_space)
+    for param in spec["boolean"]:
         setattr(cfg, param, random.random() < 0.5)
-    for param, (lo, hi) in CONTINUOUS_PARAMS.items():
+    for param in spec["continuous"]:
+        lo, hi = CONTINUOUS_PARAMS[param]
         setattr(cfg, param, random.uniform(lo, hi))
-    for param, choices in CATEGORICAL_PARAMS.items():
+    for param in spec["categorical"]:
+        choices = CATEGORICAL_PARAMS[param]
         setattr(cfg, param, random.choice(choices))
     return cfg
 
 
-def make_all_on_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+def make_all_on_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
     cfg = _base_config(base)
-    for param in BOOLEAN_PARAMS:
+    spec = get_search_space_spec(search_space)
+    for param in spec["boolean"]:
         setattr(cfg, param, True)
     return cfg
 
 
-def make_minimal_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
+def make_minimal_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
     cfg = _base_config(base)
-    for param in BOOLEAN_PARAMS:
+    spec = get_search_space_spec(search_space)
+    for param in spec["boolean"]:
         setattr(cfg, param, False)
-    cfg.max_iterations = 4
-    cfg.num_shared_blocks = 2
+    if "max_iterations" in spec["categorical"]:
+        cfg.max_iterations = 4
+    if "num_shared_blocks" in spec["categorical"]:
+        cfg.num_shared_blocks = 2
     return cfg
 
 
-def make_modulation_only_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
-    cfg = make_minimal_config(base)
-    cfg.use_global_modulation = True
-    cfg.use_layer_modulation = True
-    cfg.use_channel_gating = True
-    cfg.use_iteration_encoding = True
-    cfg.use_adaptive_modulation = True
+def make_modulation_only_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
+    cfg = make_minimal_config(base, search_space=search_space)
+    spec = get_search_space_spec(search_space)
+    for param in MODULATION_BOOLEAN_PARAMS:
+        if param in spec["boolean"]:
+            setattr(cfg, param, True)
     return cfg
 
 
-def make_halting_only_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
-    cfg = make_minimal_config(base)
-    cfg.use_attractor_halt = True
-    cfg.use_learned_halt = True
-    cfg.use_energy_budget = True
-    cfg.halt_combination = "learned"
+def make_halting_only_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
+    cfg = make_minimal_config(base, search_space=search_space)
+    spec = get_search_space_spec(search_space)
+    for param in ("use_attractor_halt", "use_learned_halt", "use_energy_budget"):
+        if param in spec["boolean"]:
+            setattr(cfg, param, True)
+    if "halt_combination" in spec["categorical"]:
+        cfg.halt_combination = "learned"
     return cfg
 
 

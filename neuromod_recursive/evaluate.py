@@ -10,6 +10,7 @@ from torch import Tensor
 from .config import NeuroModConfig
 from .data import generate_mixed_batch
 from .model import NeuroModRecursiveModel, compute_loss
+from .utils import autocast_context
 
 
 @torch.no_grad()
@@ -18,6 +19,7 @@ def evaluate_model(
     config: NeuroModConfig,
     num_batches: int = 10,
     device: torch.device = torch.device("cpu"),
+    amp_dtype: str | None = "none",
 ) -> dict:
     """Evaluate a model on synthetic data. Returns loss and iteration statistics."""
     model.eval()
@@ -31,8 +33,9 @@ def evaluate_model(
         inputs, targets = generate_mixed_batch(
             config.batch_size, config.seq_len, config.vocab_size, device=device
         )
-        logits, details = model(inputs, return_details=False)
-        loss, loss_dict = compute_loss(logits, targets, details, config)
+        with autocast_context(device, amp_dtype):
+            logits, details = model(inputs, return_details=False)
+            loss, loss_dict = compute_loss(logits, targets, details, config)
 
         total_loss += loss_dict["total_loss"] * len(inputs)
         total_task_loss += loss_dict["task_loss"] * len(inputs)
@@ -57,6 +60,7 @@ def compute_stability(
     num_runs: int = 3,
     training_steps: int = 500,
     device: torch.device = torch.device("cpu"),
+    amp_dtype: str | None = "none",
 ) -> float:
     """Measure training stability by variance of val_loss across multiple short runs."""
     from .train import train_single_config  # lazy import to avoid circular
@@ -64,7 +68,12 @@ def compute_stability(
     losses = []
     for seed in range(num_runs):
         result = train_single_config(
-            config, num_steps=training_steps, seed=seed, device=device, quiet=True
+            config,
+            num_steps=training_steps,
+            seed=seed,
+            device=device,
+            quiet=True,
+            amp_dtype=amp_dtype,
         )
         losses.append(result["val_loss"])
 

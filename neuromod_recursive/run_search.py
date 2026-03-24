@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from .config import NeuroModConfig, make_preset_config
+from .config import NeuroModConfig, SEARCH_SPACE_SPECS, make_preset_config
 from .model import NeuroModRecursiveModel, count_parameters
 from .search import run_evolutionary_search
 from .train import train_single_config, train_distributed
@@ -42,6 +42,13 @@ def parse_args():
     parser.add_argument("--novelty-k", type=int, default=15, help="k for k-nearest novelty")
     parser.add_argument("--seed", type=int, default=42, help="Master random seed")
     parser.add_argument("--output-dir", type=str, default="search_results", help="Output directory")
+    parser.add_argument(
+        "--search-space",
+        type=str,
+        default="motif_only",
+        choices=sorted(SEARCH_SPACE_SPECS.keys()),
+        help="Which subset of the recursive genome to evolve.",
+    )
     parser.add_argument(
         "--preset",
         type=str,
@@ -78,6 +85,23 @@ def parse_args():
     parser.add_argument("--num-cycles", type=int, default=None, help="Override LR restart cycle count")
     parser.add_argument("--min-lr-ratio", type=float, default=None, help="Override LR floor ratio")
     parser.add_argument("--iteration-cost", type=float, default=None, help="Override recursive ponder cost")
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        default="bf16",
+        choices=["none", "bf16", "fp16"],
+        help="Autocast dtype for CUDA training/eval.",
+    )
+    parser.add_argument("--compile-model", action="store_true", help="Use torch.compile on non-DDP model training")
+
+    # Staged search controls.
+    parser.add_argument("--screen-val-seqs", type=int, default=None, help="Validation sequences for cheap screening eval")
+    parser.add_argument("--promote-top-k", type=int, default=None, help="Promote top-K screen candidates each generation")
+    parser.add_argument("--promote-val-seqs", type=int, default=None, help="Validation sequences for promoted candidates")
+    parser.add_argument("--elite-rerank-top-k", type=int, default=None, help="Final archive elites to retrain from scratch")
+    parser.add_argument("--elite-rerank-steps", type=int, default=None, help="Training steps for elite reranking")
+    parser.add_argument("--elite-rerank-seeds", type=int, default=2, help="Seeds per elite rerank candidate")
+    parser.add_argument("--elite-val-seqs", type=int, default=None, help="Validation sequences for elite rerank eval")
 
     # Device
     parser.add_argument("--device", type=str, default=None, help="Device: cpu, cuda, cuda:0, etc.")
@@ -143,6 +167,23 @@ def main():
         )
         print(f"  FineWeb ready: vocab={args.vocab_size}, seq_len={args.seq_len}")
 
+        total_val_seqs = (fineweb_setup["val_tokens"].numel() - 1) // fineweb_setup["seq_len"]
+        if args.screen_val_seqs is None:
+            args.screen_val_seqs = min(1024, total_val_seqs)
+        if args.promote_val_seqs is None:
+            args.promote_val_seqs = min(4096, total_val_seqs)
+        if args.promote_top_k is None:
+            args.promote_top_k = max(1, args.population // 5)
+        if args.elite_rerank_top_k is None:
+            args.elite_rerank_top_k = min(3, args.population)
+        if args.elite_rerank_steps is None:
+            args.elite_rerank_steps = max(args.steps * 2, args.steps)
+    else:
+        if args.promote_top_k is None:
+            args.promote_top_k = 0
+        if args.elite_rerank_top_k is None:
+            args.elite_rerank_top_k = 0
+
     preview_config = NeuroModConfig(**vars(base_config))
     if fineweb_setup:
         preview_config.vocab_size = fineweb_setup["vocab_size"]
@@ -175,11 +216,15 @@ def main():
             result = train_distributed(
                 config, num_steps=args.steps, seed=args.seed,
                 fineweb_setup=fineweb_setup,
+                amp_dtype=args.amp_dtype,
+                compile_model=args.compile_model,
             )
         else:
             result = train_single_config(
                 config, num_steps=args.steps, seed=args.seed, device=device,
                 fineweb_setup=fineweb_setup,
+                amp_dtype=args.amp_dtype,
+                compile_model=args.compile_model,
             )
 
         print(f"\nFinal val_loss: {result['val_loss']:.4f}")
@@ -191,6 +236,14 @@ def main():
     print(f"\n--- Evolutionary Search ---")
     print(f"Population: {args.population} | Generations: {args.generations}")
     print(f"Steps/eval: {args.steps} | Novelty weight: {args.novelty_weight}")
+    print(f"Search space: {args.search_space} | AMP: {args.amp_dtype} | compile={args.compile_model}")
+    if fineweb_setup:
+        print(
+            f"Staged eval: screen={args.screen_val_seqs} seqs | "
+            f"promote_top_k={args.promote_top_k} promote_eval={args.promote_val_seqs} seqs | "
+            f"elite_top_k={args.elite_rerank_top_k} elite_steps={args.elite_rerank_steps} "
+            f"elite_seeds={args.elite_rerank_seeds}"
+        )
     print(f"Data: {'FineWeb (real BPB)' if fineweb_setup else 'Synthetic'}")
     print(f"Output: {args.output_dir}")
 
@@ -206,6 +259,16 @@ def main():
         device=device,
         fineweb_setup=fineweb_setup,
         base_config=base_config,
+        search_space=args.search_space,
+        screen_val_sequences=args.screen_val_seqs,
+        promote_top_k=args.promote_top_k,
+        promote_val_sequences=args.promote_val_seqs,
+        elite_rerank_top_k=args.elite_rerank_top_k,
+        elite_rerank_steps=args.elite_rerank_steps,
+        elite_rerank_seeds=args.elite_rerank_seeds,
+        elite_val_sequences=args.elite_val_seqs,
+        amp_dtype=args.amp_dtype,
+        compile_model=args.compile_model,
     )
     total_time = time.time() - t0
 

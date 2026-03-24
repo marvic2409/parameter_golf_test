@@ -23,7 +23,15 @@ from .config import NeuroModConfig
 from .data import generate_mixed_batch
 from .evaluate import evaluate_model
 from .model import NeuroModRecursiveModel, compute_loss, count_parameters
-from .utils import set_seed, get_device, format_param_count
+from .utils import (
+    autocast_context,
+    enable_fast_cuda_math,
+    format_param_count,
+    get_device,
+    maybe_compile_model,
+    normalize_amp_dtype,
+    set_seed,
+)
 
 
 def _make_cyclical_lr(
@@ -114,6 +122,52 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def evaluate_trained_model(
+    model: torch.nn.Module,
+    config: NeuroModConfig,
+    device: torch.device,
+    fineweb_setup: Optional[dict] = None,
+    eval_batches: int = 5,
+    amp_dtype: str | None = "none",
+) -> dict:
+    """Evaluate a trained model on either FineWeb or synthetic validation."""
+    if fineweb_setup is not None:
+        from .fineweb_eval import eval_fineweb_bpb
+
+        val_loss, val_bpb = eval_fineweb_bpb(
+            model=model,
+            val_tokens=fineweb_setup["val_tokens"],
+            seq_len=config.seq_len,
+            vocab_size=config.vocab_size,
+            base_bytes_lut=fineweb_setup["base_bytes_lut"].to(device),
+            has_leading_space_lut=fineweb_setup["has_leading_space_lut"].to(device),
+            is_boundary_token_lut=fineweb_setup["is_boundary_token_lut"].to(device),
+            batch_size=max(1, 65536 // config.seq_len),
+            device=device,
+            amp_dtype=amp_dtype,
+        )
+        return {
+            "val_loss": val_loss,
+            "val_bpb": val_bpb,
+            "task_loss": val_loss,
+            "avg_iterations": None,
+        }
+
+    eval_result = evaluate_model(
+        model,
+        config,
+        num_batches=eval_batches,
+        device=device,
+        amp_dtype=amp_dtype,
+    )
+    return {
+        "val_loss": eval_result["val_loss"],
+        "val_bpb": None,
+        "task_loss": eval_result["task_loss"],
+        "avg_iterations": eval_result["avg_iterations"],
+    }
+
+
 def train_single_config(
     config: NeuroModConfig,
     num_steps: int = 2000,
@@ -123,6 +177,9 @@ def train_single_config(
     log_every: int = 100,
     eval_batches: int = 5,
     fineweb_setup: Optional[dict] = None,
+    eval_setup: Optional[dict] = None,
+    amp_dtype: str | None = None,
+    compile_model: bool = False,
 ) -> dict:
     """Train a single config and return results.
 
@@ -134,14 +191,22 @@ def train_single_config(
     set_seed(seed)
     if device is None:
         device = get_device()
+    enable_fast_cuda_math()
+    amp_dtype = normalize_amp_dtype(amp_dtype, device)
 
     # When using FineWeb, override config to match challenge tokenizer
     if fineweb_setup is not None:
         config.vocab_size = fineweb_setup["vocab_size"]
         config.seq_len = fineweb_setup["seq_len"]
+    elif eval_setup is not None:
+        config.vocab_size = eval_setup["vocab_size"]
+        config.seq_len = eval_setup["seq_len"]
+
+    final_eval_setup = eval_setup if eval_setup is not None else fineweb_setup
 
     model = NeuroModRecursiveModel(config).to(device)
     n_params = count_parameters(model)
+    model = maybe_compile_model(model, enabled=compile_model)
 
     if not quiet:
         print(f"Model parameters: {format_param_count(n_params)}")
@@ -159,6 +224,7 @@ def train_single_config(
         token_stream = TokenStream(fineweb_setup["train_pattern"])
 
     model.train()
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == "fp16"))
     train_losses = []
     iteration_means = []
     start_time = time.time()
@@ -176,18 +242,26 @@ def train_single_config(
                 config.batch_size, config.seq_len, config.vocab_size, device=device
             )
 
-        logits, details = model(inputs, return_details=False)
-        loss, loss_dict = compute_loss(logits, targets, details, config)
+        with autocast_context(device, amp_dtype):
+            logits, details = model(inputs, return_details=False)
+            loss, loss_dict = compute_loss(logits, targets, details, config)
 
         if math.isnan(loss.item()):
             if not quiet:
                 print(f"  NaN loss at step {step}, stopping early")
             break
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         scheduler.step()
 
         train_losses.append(loss_dict["task_loss"])
@@ -210,24 +284,20 @@ def train_single_config(
         sum(iteration_means) / len(iteration_means) if iteration_means else float(config.max_iterations)
     )
 
-    if fineweb_setup is not None:
-        # Evaluate on actual FineWeb BPB
-        from .fineweb_eval import eval_fineweb_bpb
-        val_loss, val_bpb = eval_fineweb_bpb(
-            model=model,
-            val_tokens=fineweb_setup["val_tokens"],
-            seq_len=config.seq_len,
-            vocab_size=config.vocab_size,
-            base_bytes_lut=fineweb_setup["base_bytes_lut"].to(device),
-            has_leading_space_lut=fineweb_setup["has_leading_space_lut"].to(device),
-            is_boundary_token_lut=fineweb_setup["is_boundary_token_lut"].to(device),
-            batch_size=max(1, 65536 // config.seq_len),
-            device=device,
-        )
+    eval_result = evaluate_trained_model(
+        model,
+        config,
+        device=device,
+        fineweb_setup=final_eval_setup,
+        eval_batches=eval_batches,
+        amp_dtype=amp_dtype,
+    )
+
+    if final_eval_setup is not None:
         result = {
-            "val_loss": val_loss,
-            "val_bpb": val_bpb,
-            "task_loss": val_loss,
+            "val_loss": eval_result["val_loss"],
+            "val_bpb": eval_result["val_bpb"],
+            "task_loss": eval_result["task_loss"],
             "avg_iterations": avg_iterations_run,
             "train_loss_final": train_losses[-1] if train_losses else float("inf"),
             "n_params": n_params,
@@ -235,15 +305,14 @@ def train_single_config(
             "model": model,
         }
         if not quiet:
-            print(f"\n  Final: val_loss={val_loss:.4f} | val_bpb={val_bpb:.4f} | "
+            print(f"\n  Final: val_loss={result['val_loss']:.4f} | val_bpb={result['val_bpb']:.4f} | "
                   f"avg_iters={avg_iterations_run:.1f} | time={elapsed:.1f}s")
     else:
-        eval_result = evaluate_model(model, config, num_batches=eval_batches, device=device)
         result = {
             "val_loss": eval_result["val_loss"],
-            "val_bpb": None,
+            "val_bpb": eval_result["val_bpb"],
             "task_loss": eval_result["task_loss"],
-            "avg_iterations": eval_result["avg_iterations"],
+            "avg_iterations": eval_result["avg_iterations"] if eval_result["avg_iterations"] is not None else avg_iterations_run,
             "train_loss_final": train_losses[-1] if train_losses else float("inf"),
             "n_params": n_params,
             "elapsed_seconds": elapsed,
@@ -264,6 +333,9 @@ def train_distributed(
     log_every: int = 100,
     eval_batches: int = 5,
     fineweb_setup: Optional[dict] = None,
+    eval_setup: Optional[dict] = None,
+    amp_dtype: str | None = None,
+    compile_model: bool = False,
 ) -> dict:
     """Train with DDP on multiple GPUs.
 
@@ -277,12 +349,25 @@ def train_distributed(
         device = get_device()
 
     set_seed(seed + rank)
+    enable_fast_cuda_math()
+    amp_dtype = normalize_amp_dtype(amp_dtype, device)
 
     if fineweb_setup is not None:
         config.vocab_size = fineweb_setup["vocab_size"]
         config.seq_len = fineweb_setup["seq_len"]
+    elif eval_setup is not None:
+        config.vocab_size = eval_setup["vocab_size"]
+        config.seq_len = eval_setup["seq_len"]
+
+    final_eval_setup = eval_setup if eval_setup is not None else fineweb_setup
 
     model = NeuroModRecursiveModel(config).to(device)
+    n_params = count_parameters(model)
+
+    if compile_model and is_dist and rank == 0:
+        print("compile_model is ignored in distributed mode")
+    if compile_model and not is_dist:
+        model = maybe_compile_model(model, enabled=True)
 
     if is_dist:
         model = DDP(model, device_ids=[local_rank])
@@ -290,7 +375,6 @@ def train_distributed(
     else:
         base_model = model
 
-    n_params = count_parameters(base_model)
     is_master = rank == 0
 
     if is_master:
@@ -318,6 +402,7 @@ def train_distributed(
             token_stream = TokenStream(fineweb_setup["train_pattern"])
 
     model.train()
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == "fp16"))
     train_losses = []
     iteration_means = []
     start_time = time.time()
@@ -336,18 +421,26 @@ def train_distributed(
                 config.batch_size, config.seq_len, config.vocab_size, device=device
             )
 
-        logits, details = model(inputs, return_details=False)
-        loss, loss_dict = compute_loss(logits, targets, details, config)
+        with autocast_context(device, amp_dtype):
+            logits, details = model(inputs, return_details=False)
+            loss, loss_dict = compute_loss(logits, targets, details, config)
 
         if math.isnan(loss.item()):
             if is_master:
                 print(f"  NaN loss at step {step}, stopping early")
             break
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         scheduler.step()
 
         train_losses.append(loss_dict["task_loss"])
@@ -369,28 +462,16 @@ def train_distributed(
     )
 
     if is_master:
-        if fineweb_setup is not None:
-            from .fineweb_eval import eval_fineweb_bpb
-            val_loss, val_bpb = eval_fineweb_bpb(
-                model=base_model,
-                val_tokens=fineweb_setup["val_tokens"],
-                seq_len=config.seq_len,
-                vocab_size=config.vocab_size,
-                base_bytes_lut=fineweb_setup["base_bytes_lut"].to(device),
-                has_leading_space_lut=fineweb_setup["has_leading_space_lut"].to(device),
-                is_boundary_token_lut=fineweb_setup["is_boundary_token_lut"].to(device),
-                batch_size=max(1, 65536 // config.seq_len),
-                device=device,
-            )
-            eval_result = {
-                "val_loss": val_loss,
-                "val_bpb": val_bpb,
-                "task_loss": val_loss,
-                "avg_iterations": avg_iterations_run,
-            }
-        else:
-            eval_result = evaluate_model(base_model, config, num_batches=eval_batches, device=device)
-            eval_result["val_bpb"] = None
+        eval_result = evaluate_trained_model(
+            base_model,
+            config,
+            device=device,
+            fineweb_setup=final_eval_setup,
+            eval_batches=eval_batches,
+            amp_dtype=amp_dtype,
+        )
+        if eval_result["avg_iterations"] is None:
+            eval_result["avg_iterations"] = avg_iterations_run
     else:
         eval_result = {"val_loss": 0, "val_bpb": None, "task_loss": 0, "avg_iterations": avg_iterations_run}
 

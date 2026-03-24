@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import asdict, fields
 from typing import Optional
 
@@ -62,6 +63,41 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def enable_fast_cuda_math() -> None:
+    """Enable fast matmul paths on modern NVIDIA GPUs."""
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def normalize_amp_dtype(amp_dtype: str | None, device: torch.device) -> str:
+    if device.type != "cuda":
+        return "none"
+    if amp_dtype is None:
+        return "bf16"
+    amp_dtype = amp_dtype.lower()
+    if amp_dtype not in {"none", "bf16", "fp16"}:
+        raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
+    return amp_dtype
+
+
+def autocast_context(device: torch.device, amp_dtype: str | None):
+    resolved = normalize_amp_dtype(amp_dtype, device)
+    if resolved == "none":
+        return nullcontext()
+    dtype = torch.bfloat16 if resolved == "bf16" else torch.float16
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+def maybe_compile_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Module:
+    if not enabled:
+        return model
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        return model
+    return compile_fn(model)
 
 
 def format_param_count(n: int) -> str:

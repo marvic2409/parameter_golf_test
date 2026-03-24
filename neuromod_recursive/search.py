@@ -7,6 +7,7 @@ it remains viable under the Parameter Golf challenge constraints (16MB artifact,
 from __future__ import annotations
 
 import copy
+import heapq
 import json
 import math
 import os
@@ -23,8 +24,8 @@ from .config import (
     make_random_config, BOOLEAN_PARAMS,
 )
 from .compression import measure_compressed_size, quantize_state_dict_int8, dequantize_state_dict_int8
-from .model import NeuroModRecursiveModel, count_parameters
-from .train import train_single_config
+from .model import NeuroModRecursiveModel
+from .train import evaluate_trained_model, train_single_config
 from .evaluate import evaluate_model
 from .novelty.behavioral import (
     BehavioralProfile, compute_behavioral_profile, generate_diagnostic_probes,
@@ -32,7 +33,7 @@ from .novelty.behavioral import (
 from .novelty.map_elites import MAPElitesArchive
 from .novelty.speciation import SpeciationManager
 from .novelty.novelty import compute_novelty
-from .utils import set_seed, config_to_dict, save_config, get_device
+from .utils import config_to_dict, get_device, set_seed
 
 
 def compute_composite_fitness(
@@ -89,6 +90,144 @@ def tournament_select(
     return copy.deepcopy(best[0])
 
 
+def _score_from_eval_result(eval_result: dict) -> float:
+    if eval_result.get("val_bpb") is not None:
+        return float(eval_result["val_bpb"])
+    return float(eval_result["val_loss"])
+
+
+def _snapshot_state_dict_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().to(device="cpu").clone()
+        for name, tensor in model.state_dict().items()
+    }
+
+
+def _build_eval_stages(
+    fineweb_setup: Optional[dict],
+    screen_val_sequences: Optional[int],
+    promote_val_sequences: Optional[int],
+    elite_val_sequences: Optional[int],
+) -> dict[str, Optional[dict]]:
+    if fineweb_setup is None:
+        return {"screen": None, "promote": None, "elite": None}
+
+    from .fineweb_eval import make_eval_subset
+
+    total_sequences = (fineweb_setup["val_tokens"].numel() - 1) // fineweb_setup["seq_len"]
+
+    def centered_offset(num_sequences: int | None) -> int:
+        if num_sequences is None:
+            return 0
+        used = min(num_sequences, total_sequences)
+        return max(0, (total_sequences - used) // 2)
+
+    def tail_offset(num_sequences: int | None) -> int:
+        if num_sequences is None:
+            return 0
+        used = min(num_sequences, total_sequences)
+        return max(0, total_sequences - used)
+
+    return {
+        "screen": make_eval_subset(fineweb_setup, screen_val_sequences, sequence_offset=0)
+        if screen_val_sequences is not None else fineweb_setup,
+        "promote": make_eval_subset(fineweb_setup, promote_val_sequences, sequence_offset=centered_offset(promote_val_sequences))
+        if promote_val_sequences is not None else fineweb_setup,
+        "elite": make_eval_subset(fineweb_setup, elite_val_sequences, sequence_offset=tail_offset(elite_val_sequences))
+        if elite_val_sequences is not None else fineweb_setup,
+    }
+
+
+def _seed_population(
+    population_size: int,
+    base_config: NeuroModConfig,
+    search_space: str,
+) -> list[NeuroModConfig]:
+    population = [
+        make_all_on_config(base_config, search_space=search_space),
+        make_minimal_config(base_config, search_space=search_space),
+    ]
+    if search_space != "halting_only":
+        population.append(make_modulation_only_config(base_config, search_space=search_space))
+    if search_space != "modulation_only":
+        population.append(make_halting_only_config(base_config, search_space=search_space))
+    while len(population) < population_size:
+        population.append(make_random_config(base_config, search_space=search_space))
+    return population[:population_size]
+
+
+def _rerank_archive_elites(
+    archive: MAPElitesArchive,
+    top_k: int,
+    rerank_steps: int,
+    rerank_seeds: int,
+    device: torch.device,
+    training_seed: int,
+    fineweb_setup: Optional[dict],
+    eval_setup: Optional[dict],
+    amp_dtype: str | None,
+    compile_model: bool,
+) -> list[dict]:
+    if top_k <= 0 or rerank_seeds <= 0:
+        return []
+
+    elite_entries = []
+    for archive_rank, (cfg, _, profile) in enumerate(archive.best_configs(top_k), start=1):
+        cfg = copy.deepcopy(cfg)
+        seed_scores = []
+        seed_sizes = []
+        seed_iterations = []
+        for seed_idx in range(rerank_seeds):
+            result = train_single_config(
+                cfg,
+                num_steps=rerank_steps,
+                seed=training_seed + archive_rank * 100 + seed_idx,
+                device=device,
+                quiet=True,
+                fineweb_setup=fineweb_setup,
+                eval_setup=eval_setup,
+                amp_dtype=amp_dtype,
+                compile_model=compile_model,
+            )
+            model = result["model"]
+            size_stats = measure_compressed_size(model)
+            quant_obj, _ = quantize_state_dict_int8(model.state_dict())
+            dequant_state = dequantize_state_dict_int8(quant_obj)
+            model.load_state_dict(dequant_state)
+            eval_result = evaluate_trained_model(
+                model,
+                cfg,
+                device=device,
+                fineweb_setup=eval_setup,
+                amp_dtype=amp_dtype,
+            )
+            seed_scores.append(_score_from_eval_result(eval_result))
+            seed_sizes.append(size_stats["zlib_compressed_bytes"])
+            seed_iterations.append(result["avg_iterations"])
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        mean_score = sum(seed_scores) / len(seed_scores)
+        variance = 0.0
+        if len(seed_scores) > 1:
+            variance = sum((score - mean_score) ** 2 for score in seed_scores) / len(seed_scores)
+        elite_entries.append({
+            "archive_rank": archive_rank,
+            "config": config_to_dict(cfg),
+            "score_mean": mean_score,
+            "score_std": math.sqrt(variance),
+            "avg_iterations_mean": sum(seed_iterations) / len(seed_iterations),
+            "compressed_bytes_mean": sum(seed_sizes) / len(seed_sizes),
+            "profile_mean_iterations": profile.mean_iterations,
+            "profile_iteration_variance": profile.iteration_variance,
+            "seed_scores": seed_scores,
+        })
+
+    elite_entries.sort(key=lambda item: item["score_mean"])
+    return elite_entries
+
+
 def run_evolutionary_search(
     population_size: int = 30,
     num_generations: int = 20,
@@ -101,6 +240,16 @@ def run_evolutionary_search(
     quiet: bool = False,
     fineweb_setup: Optional[dict] = None,
     base_config: Optional[NeuroModConfig] = None,
+    search_space: str = "motif_only",
+    screen_val_sequences: Optional[int] = None,
+    promote_top_k: int = 0,
+    promote_val_sequences: Optional[int] = None,
+    elite_rerank_top_k: int = 0,
+    elite_rerank_steps: Optional[int] = None,
+    elite_rerank_seeds: int = 1,
+    elite_val_sequences: Optional[int] = None,
+    amp_dtype: str | None = None,
+    compile_model: bool = False,
 ) -> MAPElitesArchive:
     """Run the full evolutionary search with MAP-Elites + speciation + novelty."""
     set_seed(seed)
@@ -111,10 +260,19 @@ def run_evolutionary_search(
     archive = MAPElitesArchive()
     speciation_mgr = SpeciationManager(threshold=4.0)
     score_label = "val_bpb" if fineweb_setup is not None else "val_loss"
+    promote_top_k = min(max(promote_top_k, 0), population_size)
+    elite_rerank_top_k = max(elite_rerank_top_k, 0)
+    elite_rerank_steps = elite_rerank_steps or max(training_steps_per_eval * 2, training_steps_per_eval)
 
     # If using FineWeb, override vocab/seq in all configs
     fw_vocab = fineweb_setup["vocab_size"] if fineweb_setup else None
     fw_seq = fineweb_setup["seq_len"] if fineweb_setup else None
+    eval_stages = _build_eval_stages(
+        fineweb_setup,
+        screen_val_sequences=screen_val_sequences,
+        promote_val_sequences=promote_val_sequences,
+        elite_val_sequences=elite_val_sequences,
+    )
 
     # Generate fixed diagnostic probes
     probe_vocab = fw_vocab or 512
@@ -125,14 +283,7 @@ def run_evolutionary_search(
 
     # --- Initialize population ---
     seed_config = copy.deepcopy(base_config) if base_config is not None else NeuroModConfig()
-    population = [
-        make_all_on_config(seed_config),
-        make_minimal_config(seed_config),
-        make_modulation_only_config(seed_config),
-        make_halting_only_config(seed_config),
-    ]
-    while len(population) < population_size:
-        population.append(make_random_config(seed_config))
+    population = _seed_population(population_size, seed_config, search_space)
 
     coverage_history = []
     generation_logs = []
@@ -140,6 +291,8 @@ def run_evolutionary_search(
     for gen in range(num_generations):
         gen_start = time.time()
         results = []
+        promoted_heap: list[tuple[float, int]] = []
+        promoted_snapshots: dict[int, dict[str, torch.Tensor]] = {}
         speciation_mgr.clear_members()
 
         if not quiet:
@@ -163,6 +316,9 @@ def run_evolutionary_search(
                 device=device,
                 quiet=True,
                 fineweb_setup=fineweb_setup,
+                eval_setup=eval_stages["screen"],
+                amp_dtype=amp_dtype,
+                compile_model=compile_model,
             )
             model = train_result["model"]
             score_pre = train_result["val_bpb"] if train_result.get("val_bpb") is not None else train_result["val_loss"]
@@ -178,25 +334,15 @@ def run_evolutionary_search(
             dequant_state = dequantize_state_dict_int8(quant_obj)
             model.load_state_dict(dequant_state)
 
-            # Re-evaluate after quantization to get the actual challenge score
-            if fineweb_setup is not None:
-                from .fineweb_eval import eval_fineweb_bpb
-                val_loss_post, val_bpb_post = eval_fineweb_bpb(
-                    model=model,
-                    val_tokens=fineweb_setup["val_tokens"],
-                    seq_len=config.seq_len,
-                    vocab_size=config.vocab_size,
-                    base_bytes_lut=fineweb_setup["base_bytes_lut"].to(device),
-                    has_leading_space_lut=fineweb_setup["has_leading_space_lut"].to(device),
-                    is_boundary_token_lut=fineweb_setup["is_boundary_token_lut"].to(device),
-                    batch_size=max(1, 65536 // config.seq_len),
-                    device=device,
-                )
-                score_post = val_bpb_post
-            else:
-                eval_post = evaluate_model(model, config, num_batches=3, device=device)
-                val_loss_post = eval_post["val_loss"]
-                score_post = val_loss_post
+            screen_eval = evaluate_trained_model(
+                model,
+                config,
+                device=device,
+                fineweb_setup=eval_stages["screen"],
+                eval_batches=3,
+                amp_dtype=amp_dtype,
+            )
+            score_post = _score_from_eval_result(screen_eval)
 
             # Use the post-quantization challenge metric as the real score.
             score_value = score_post
@@ -222,41 +368,107 @@ def run_evolutionary_search(
                 w_novelty=novelty_weight,
             )
 
-            # Update archive
-            is_new = archive.add(config, fitness, profile)
+            results.append({
+                "config": copy.deepcopy(config),
+                "fitness": fitness,
+                "profile": profile,
+                "score_value": score_value,
+                "screen_score": score_value,
+                "score_pre": score_pre,
+                "novelty": novelty,
+                "avg_iters": avg_iters,
+                "compressed_bytes": compressed_bytes,
+                "quant_degradation": quant_degradation,
+                "promoted": False,
+                "eval_time_seconds": time.time() - eval_start,
+            })
 
-            # Species assignment
-            species = speciation_mgr.assign_species(config)
-            species.update_fitness(fitness)
-
-            results.append((config, fitness, profile, species, score_value, novelty))
+            if promote_top_k > 0:
+                provisional = (fitness, idx)
+                should_snapshot = len(promoted_heap) < promote_top_k or fitness > promoted_heap[0][0]
+                if should_snapshot:
+                    snapshot = _snapshot_state_dict_cpu(model)
+                    if len(promoted_heap) < promote_top_k:
+                        heapq.heappush(promoted_heap, provisional)
+                    else:
+                        _, dropped_idx = heapq.heapreplace(promoted_heap, provisional)
+                        promoted_snapshots.pop(dropped_idx, None)
+                    promoted_snapshots[idx] = snapshot
 
             # Free model memory
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            eval_time = time.time() - eval_start
             if not quiet:
-                status = "NEW_NICHE" if is_new else ""
                 mb = compressed_bytes / 1_000_000
                 size_ok = "OK" if mb < 16.0 else "OVER"
                 print(
                     f"  [{idx + 1}/{len(population)}] "
-                    f"{score_label}={score_value:.4f} fitness={fitness:.4f} "
+                    f"screen_{score_label}={score_value:.4f} fitness={fitness:.4f} "
                     f"novelty={novelty:.3f} iters={avg_iters:.1f} "
                     f"size={mb:.2f}MB({size_ok}) qdeg={quant_degradation:.4f} "
-                    f"species={species.id} {status} "
-                    f"({eval_time:.1f}s)"
+                    f"stage=screen ({results[-1]['eval_time_seconds']:.1f}s)"
+                )
+
+        for idx in sorted(promoted_snapshots, key=lambda i: results[i]["fitness"], reverse=True):
+            entry = results[idx]
+            config = entry["config"]
+            model = NeuroModRecursiveModel(config).to(device)
+            model.load_state_dict(promoted_snapshots[idx])
+            promote_eval = evaluate_trained_model(
+                model,
+                config,
+                device=device,
+                fineweb_setup=eval_stages["promote"],
+                eval_batches=8,
+                amp_dtype=amp_dtype,
+            )
+            promoted_score = _score_from_eval_result(promote_eval)
+            entry["score_value"] = promoted_score
+            entry["fitness"] = compute_composite_fitness(
+                promoted_score,
+                entry["avg_iters"],
+                0.0,
+                entry["novelty"],
+                config,
+                compressed_bytes=entry["compressed_bytes"],
+                quant_degradation=entry["quant_degradation"],
+                w_novelty=novelty_weight,
+            )
+            entry["promoted"] = True
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if not quiet:
+                print(
+                    f"    promoted [{idx + 1}/{len(population)}] "
+                    f"{score_label}: {entry['screen_score']:.4f}->{promoted_score:.4f} "
+                    f"fitness={entry['fitness']:.4f}"
+                )
+
+        for entry in results:
+            config = entry["config"]
+            fitness = entry["fitness"]
+            profile = entry["profile"]
+            is_new = archive.add(config, fitness, profile)
+            species = speciation_mgr.assign_species(config)
+            species.update_fitness(fitness)
+            entry["species"] = species
+            entry["is_new"] = is_new
+            if not quiet and entry["promoted"]:
+                print(
+                    f"      archive species={species.id} "
+                    f"{'NEW_NICHE' if is_new else ''}".rstrip()
                 )
 
         # --- Log generation ---
         gen_time = time.time() - gen_start
         archive_stats = archive.stats()
         species_stats = speciation_mgr.stats()
-        fitnesses = [f for _, f, _, _, _, _ in results]
-        scores = [score for _, _, _, _, score, _ in results]
-        novelties = [n for _, _, _, _, _, n in results]
+        fitnesses = [entry["fitness"] for entry in results]
+        scores = [entry["score_value"] for entry in results]
+        novelties = [entry["novelty"] for entry in results]
 
         gen_log = {
             "generation": gen + 1,
@@ -270,6 +482,8 @@ def run_evolutionary_search(
             "novelty_mean": sum(novelties) / len(novelties),
             "time_seconds": gen_time,
             "novelty_weight": novelty_weight,
+            "promoted_count": sum(1 for entry in results if entry["promoted"]),
+            "search_space": search_space,
         }
         generation_logs.append(gen_log)
         coverage_history.append(archive_stats["coverage"])
@@ -293,9 +507,9 @@ def run_evolutionary_search(
         # Per-species reproduction
         for species, num_offspring in offspring_allocation.items():
             members_ranked = [
-                (cfg, fit)
-                for cfg, fit, _, sp, _, _ in results
-                if sp == species
+                (entry["config"], entry["fitness"])
+                for entry in results
+                if entry["species"] == species
             ]
             members_ranked.sort(key=lambda x: x[1], reverse=True)
 
@@ -309,9 +523,9 @@ def run_evolutionary_search(
                     child = crossover(p1, p2)
                 else:
                     parent = tournament_select(members_ranked, k=3)
-                    child = mutate(parent)
+                    child = mutate(parent, search_space=search_space)
 
-                child = mutate(child)
+                child = mutate(child, search_space=search_space)
                 new_population.append(child)
 
         # Inject archive samples for exploration
@@ -319,7 +533,10 @@ def run_evolutionary_search(
         for _ in range(num_archive_samples):
             if archive.grid:
                 parent = archive.sample_parent()
-                child = mutate(mutate(copy.deepcopy(parent)))
+                child = mutate(
+                    mutate(copy.deepcopy(parent), search_space=search_space),
+                    search_space=search_space,
+                )
                 new_population.append(child)
 
         population = new_population[:population_size]
@@ -335,8 +552,38 @@ def run_evolutionary_search(
         # Save checkpoint
         _save_checkpoint(output_dir, gen, archive, generation_logs)
 
+    elite_rerank_results = _rerank_archive_elites(
+        archive,
+        top_k=elite_rerank_top_k,
+        rerank_steps=elite_rerank_steps,
+        rerank_seeds=elite_rerank_seeds,
+        device=device,
+        training_seed=seed + num_generations * 1000,
+        fineweb_setup=fineweb_setup,
+        eval_setup=eval_stages["elite"],
+        amp_dtype=amp_dtype,
+        compile_model=compile_model,
+    )
+
+    if elite_rerank_results and not quiet:
+        print("\nElite rerank:")
+        for item in elite_rerank_results[:5]:
+            print(
+                f"  archive_rank={item['archive_rank']} "
+                f"score_mean={item['score_mean']:.4f} "
+                f"score_std={item['score_std']:.4f} "
+                f"bytes={item['compressed_bytes_mean'] / 1_000_000:.2f}MB"
+            )
+
     # Final save
-    _save_checkpoint(output_dir, num_generations - 1, archive, generation_logs, final=True)
+    _save_checkpoint(
+        output_dir,
+        num_generations - 1,
+        archive,
+        generation_logs,
+        final=True,
+        elite_rerank_results=elite_rerank_results,
+    )
 
     return archive
 
@@ -347,6 +594,7 @@ def _save_checkpoint(
     archive: MAPElitesArchive,
     generation_logs: list,
     final: bool = False,
+    elite_rerank_results: Optional[list[dict]] = None,
 ):
     """Save search state to disk."""
     # Save generation logs
@@ -386,3 +634,8 @@ def _save_checkpoint(
         freq_path = os.path.join(output_dir, "mechanism_frequency.json")
         with open(freq_path, "w") as f:
             json.dump(freq, f, indent=2)
+
+        if elite_rerank_results:
+            rerank_path = os.path.join(output_dir, "elite_rerank.json")
+            with open(rerank_path, "w") as f:
+                json.dump(elite_rerank_results, f, indent=2)

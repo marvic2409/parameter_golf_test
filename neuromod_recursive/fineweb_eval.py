@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .utils import autocast_context
+
 # --- Data loading (mirrors train_gpt.py) ---
 
 def load_data_shard(file: Path) -> Tensor:
@@ -148,6 +150,7 @@ def eval_fineweb_bpb(
     is_boundary_token_lut: Tensor,
     batch_size: int = 8,
     device: torch.device = torch.device("cpu"),
+    amp_dtype: str | None = "none",
 ) -> tuple[float, float]:
     """Evaluate a model on FineWeb validation tokens.
 
@@ -175,7 +178,8 @@ def eval_fineweb_bpb(
         y = local[1:].reshape(actual_batch, seq_len)
 
         # Forward pass — handle both our model (returns logits, details) and standard models
-        output = model(x)
+        with autocast_context(device, amp_dtype):
+            output = model(x)
         if isinstance(output, tuple):
             logits = output[0]
         else:
@@ -208,6 +212,38 @@ def eval_fineweb_bpb(
 
     model.train()
     return float(val_loss), float(val_bpb)
+
+
+def make_eval_subset(
+    fineweb_setup: dict,
+    max_sequences: int | None = None,
+    sequence_offset: int = 0,
+) -> dict:
+    """Return a shallow copy of a FineWeb eval setup with a smaller validation slice."""
+    if max_sequences is None:
+        return fineweb_setup
+
+    seq_len = int(fineweb_setup["seq_len"])
+    val_tokens = fineweb_setup["val_tokens"]
+    total_sequences = (val_tokens.numel() - 1) // seq_len
+    if total_sequences <= 0:
+        raise ValueError("FineWeb validation set is empty")
+    if max_sequences <= 0:
+        raise ValueError("max_sequences must be positive")
+
+    start_seq = max(0, min(sequence_offset, total_sequences - 1))
+    subset_sequences = min(max_sequences, total_sequences - start_seq)
+    if subset_sequences <= 0:
+        subset_sequences = min(max_sequences, total_sequences)
+        start_seq = 0
+
+    start = start_seq * seq_len
+    end = start + subset_sequences * seq_len + 1
+    subset = dict(fineweb_setup)
+    subset["val_tokens"] = val_tokens[start:end].contiguous()
+    subset["eval_subset_start_sequence"] = start_seq
+    subset["eval_subset_num_sequences"] = subset_sequences
+    return subset
 
 
 def setup_fineweb_eval(
