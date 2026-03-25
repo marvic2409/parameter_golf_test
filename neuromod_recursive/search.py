@@ -234,27 +234,53 @@ def _rerank_archive_elites(
     amp_dtype: str | None,
     compile_model: bool,
     extra_score_candidates: Optional[list[dict]] = None,
+    quiet: bool = False,
 ) -> list[dict]:
     if top_k <= 0 or rerank_seeds <= 0:
         return []
 
     elite_entries = []
-    candidate_pool: list[tuple[NeuroModConfig, BehavioralProfile, str, float]] = []
+    archive_candidates: list[tuple[NeuroModConfig, BehavioralProfile, str, float]] = []
+    score_candidates: list[tuple[NeuroModConfig, BehavioralProfile, str, float]] = []
     seen_keys: set[str] = set()
     for archive_rank, (cfg, _, profile) in enumerate(archive.best_configs(top_k), start=1):
         key = _config_key(cfg)
         seen_keys.add(key)
-        candidate_pool.append((copy.deepcopy(cfg), profile, "archive", float(archive_rank)))
+        archive_candidates.append((copy.deepcopy(cfg), profile, "archive", float(archive_rank)))
     if extra_score_candidates:
-        for rank, item in enumerate(extra_score_candidates[:top_k], start=1):
+        for rank, item in enumerate(extra_score_candidates, start=1):
             cfg = copy.deepcopy(item["config"])
             key = _config_key(cfg)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            candidate_pool.append((cfg, item["profile"], "score", float(rank)))
+            score_candidates.append((cfg, item["profile"], "score", float(rank)))
+
+    candidate_pool: list[tuple[NeuroModConfig, BehavioralProfile, str, float]] = []
+    archive_idx = 0
+    score_idx = 0
+    while len(candidate_pool) < top_k and (archive_idx < len(archive_candidates) or score_idx < len(score_candidates)):
+        if archive_idx < len(archive_candidates):
+            candidate_pool.append(archive_candidates[archive_idx])
+            archive_idx += 1
+            if len(candidate_pool) >= top_k:
+                break
+        if score_idx < len(score_candidates):
+            candidate_pool.append(score_candidates[score_idx])
+            score_idx += 1
+
+    if not quiet and candidate_pool:
+        print(
+            f"\nElite rerank: {len(candidate_pool)} candidates x {rerank_seeds} seeds "
+            f"({len(candidate_pool) * rerank_seeds} runs, {rerank_steps} steps each)"
+        )
 
     for pool_rank, (cfg, profile, source, source_rank) in enumerate(candidate_pool, start=1):
+        if not quiet:
+            print(
+                f"  rerank [{pool_rank}/{len(candidate_pool)}] "
+                f"source={source} rank={int(source_rank)}"
+            )
         cfg = copy.deepcopy(cfg)
         seed_scores = []
         seed_sizes = []
@@ -746,13 +772,16 @@ def run_evolutionary_search(
         amp_dtype=amp_dtype,
         compile_model=compile_model,
         extra_score_candidates=score_leaders,
+        quiet=quiet,
     )
 
     if elite_rerank_results and not quiet:
-        print("\nElite rerank:")
+        print("\nElite rerank results:")
         for item in elite_rerank_results[:5]:
             print(
-                f"  archive_rank={item['archive_rank']} "
+                f"  source={item['source']} "
+                f"archive_rank={item['archive_rank']} "
+                f"score_rank={item['score_rank']} "
                 f"score_mean={item['score_mean']:.4f} "
                 f"score_std={item['score_std']:.4f} "
                 f"bytes={item['compressed_bytes_mean'] / 1_000_000:.2f}MB"
