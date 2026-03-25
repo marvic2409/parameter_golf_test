@@ -758,6 +758,9 @@ def run_evolutionary_search(
         # Save checkpoint
         score_leaders = sorted(score_leaderboard.values(), key=lambda item: item["score_value"])[:10]
         _save_checkpoint(output_dir, gen, archive, generation_logs, score_leaders=score_leaders)
+        candidates_path = os.path.join(output_dir, f"generation_{gen + 1:03d}_candidates.json")
+        with open(candidates_path, "w") as f:
+            json.dump(_serialize_generation_candidates(results, score_label), f, indent=2)
 
     score_leaders = sorted(score_leaderboard.values(), key=lambda item: item["score_value"])[:max(10, elite_rerank_top_k)]
     elite_rerank_results = _rerank_archive_elites(
@@ -869,3 +872,33 @@ def _save_checkpoint(
             rerank_path = os.path.join(output_dir, "elite_rerank.json")
             with open(rerank_path, "w") as f:
                 json.dump(elite_rerank_results, f, indent=2)
+
+
+def _serialize_generation_candidates(
+    results: list[dict],
+    score_label: str,
+) -> list[dict]:
+    serialized = []
+    for entry in results:
+        species = entry.get("species")
+        serialized.append({
+            "config": config_to_dict(entry["config"]),
+            "fitness": entry["fitness"],
+            "score_name": score_label,
+            "score_value": entry["score_value"],
+            "screen_score": entry["screen_score"],
+            "prequant_score": entry["score_pre"],
+            "novelty": entry["novelty"],
+            "transformed_novelty": entry["transformed_novelty"],
+            "avg_iterations": entry["avg_iters"],
+            "compressed_bytes": entry["compressed_bytes"],
+            "quant_degradation": entry["quant_degradation"],
+            "promoted": entry["promoted"],
+            "eval_time_seconds": entry["eval_time_seconds"],
+            "species_id": species.id if species is not None else None,
+            "archive_inserted": entry.get("is_new", False),
+            "mean_iterations": entry["profile"].mean_iterations,
+            "iteration_variance": entry["profile"].iteration_variance,
+        })
+    serialized.sort(key=lambda item: item["score_value"])
+    return serialized
