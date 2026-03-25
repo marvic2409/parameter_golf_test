@@ -200,7 +200,11 @@ def compute_behavioral_profile(
         if isinstance(expected_iterations, torch.Tensor):
             all_iterations.extend(expected_iterations.detach().cpu().tolist())
         else:
-            n_iters = float(details.get("num_iterations", config.max_iterations))
+            n_iters = details.get("num_iterations", config.max_iterations)
+            if isinstance(n_iters, torch.Tensor):
+                n_iters = float(n_iters.detach().cpu().item())
+            else:
+                n_iters = float(n_iters)
             all_iterations.extend([n_iters] * len(batch))
 
         halt_distribution = details.get("halt_distribution")

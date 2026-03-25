@@ -97,7 +97,11 @@ def maybe_compile_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Modul
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         return model
-    return compile_fn(model)
+    from torch import _dynamo
+
+    _dynamo.config.capture_scalar_outputs = True
+    _dynamo.config.suppress_errors = True
+    return compile_fn(model, mode="reduce-overhead")
 
 
 def format_param_count(n: int) -> str:

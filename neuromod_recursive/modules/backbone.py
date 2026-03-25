@@ -62,8 +62,21 @@ class SharedTransformerBlock(nn.Module):
         if modulation is None:
             modulation = {}
 
-        weight_scale = modulation.get("weight_scale", 1.0)
-        residual_scale = modulation.get("residual_scale", 1.0)
+        weight_scale = modulation.get("weight_scale")
+        if weight_scale is None:
+            weight_scale = x.new_tensor(1.0)
+        elif not torch.is_tensor(weight_scale):
+            weight_scale = x.new_tensor(float(weight_scale))
+        else:
+            weight_scale = weight_scale.to(device=x.device, dtype=x.dtype)
+
+        residual_scale = modulation.get("residual_scale")
+        if residual_scale is None:
+            residual_scale = x.new_tensor(1.0)
+        elif not torch.is_tensor(residual_scale):
+            residual_scale = x.new_tensor(float(residual_scale))
+        else:
+            residual_scale = residual_scale.to(device=x.device, dtype=x.dtype)
 
         # --- Pre-attention modulation ---
         h = self.norm1(x)
@@ -74,18 +87,14 @@ class SharedTransformerBlock(nn.Module):
 
         # --- Self-attention ---
         B, T, C = h.shape
-        qkv = self.qkv(h)
-        if weight_scale != 1.0:
-            qkv = qkv * weight_scale
+        qkv = self.qkv(h) * weight_scale
         qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D)
         q, k, v = qkv.unbind(0)
 
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn = attn.transpose(1, 2).contiguous().view(B, T, C)
-        attn_out = self.out_proj(attn)
-        if weight_scale != 1.0:
-            attn_out = attn_out * weight_scale
+        attn_out = self.out_proj(attn) * weight_scale
 
         # Channel gating on attention output
         if "channel_gate" in modulation:
@@ -101,9 +110,7 @@ class SharedTransformerBlock(nn.Module):
             h = h + modulation["ffn_shift"]
 
         # --- Feedforward ---
-        ff_out = self.ff(h)
-        if weight_scale != 1.0:
-            ff_out = ff_out * weight_scale
+        ff_out = self.ff(h) * weight_scale
 
         if "channel_gate" in modulation:
             ff_out = ff_out * modulation["channel_gate"]

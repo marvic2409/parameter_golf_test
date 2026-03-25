@@ -1,8 +1,6 @@
-"""Oscillatory gating — gamma/beta-inspired rhythm per transformer block."""
+"""Oscillatory gating - gamma/beta-inspired rhythm per transformer block."""
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
@@ -23,5 +21,6 @@ class OscillatoryGating(nn.Module):
         amp = self.amplitude[block_idx]
         freq = self.frequency[block_idx]
         ph = self.phase[block_idx]
-        gate = torch.sigmoid(amp * torch.sin(2.0 * math.pi * freq * iteration + ph))
+        iteration_t = amp.new_tensor(float(iteration))
+        gate = torch.sigmoid(amp * torch.sin((2.0 * torch.pi * freq * iteration_t) + ph))
         return gate

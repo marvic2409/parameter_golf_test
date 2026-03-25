@@ -1,8 +1,7 @@
-"""Modulator network — small side-network generating modulation signals."""
+"""Modulator network - small side-network generating modulation signals."""
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -93,12 +92,12 @@ class ModulatorNetwork(nn.Module):
             nn.init.constant_(self.gate_head.bias, 0.85)  # sigmoid(0.85) ≈ 0.7
 
     def _sinusoidal_encoding(self, iteration: int, dim: int, device: torch.device) -> Tensor:
-        pe = torch.zeros(dim, device=device)
-        for i in range(0, dim, 2):
-            freq = 1.0 / (10000.0 ** (i / dim))
-            pe[i] = math.sin(iteration * freq)
-            if i + 1 < dim:
-                pe[i + 1] = math.cos(iteration * freq)
+        positions = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+        denom = torch.pow(10000.0, positions / dim)
+        phase = torch.full_like(positions, float(iteration)) / denom
+        pe = torch.zeros(dim, device=device, dtype=torch.float32)
+        pe[0::2] = torch.sin(phase)
+        pe[1::2] = torch.cos(phase[: pe[1::2].numel()])
         return pe
 
     def forward(

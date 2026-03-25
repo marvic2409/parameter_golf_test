@@ -153,8 +153,13 @@ class NeuroModRecursiveModel(nn.Module):
 
             # 4c. Apply synaptic depression
             if cfg.use_synaptic_depression:
-                depression_mult = self.synaptic_depression(i)
-                modulation["weight_scale"] = modulation.get("weight_scale", 1.0) * depression_mult
+                depression_mult = h.new_tensor(self.synaptic_depression(i))
+                base_weight_scale = modulation.get("weight_scale")
+                if base_weight_scale is None:
+                    base_weight_scale = depression_mult.new_tensor(1.0)
+                elif not torch.is_tensor(base_weight_scale):
+                    base_weight_scale = depression_mult.new_tensor(float(base_weight_scale))
+                modulation["weight_scale"] = base_weight_scale * depression_mult
             modulation_stats = _summarize_modulation(modulation, B, device) if return_details else None
 
             # 4d. Run shared blocks with modulation
@@ -164,7 +169,14 @@ class NeuroModRecursiveModel(nn.Module):
                 # Oscillatory gating
                 if cfg.use_oscillatory_gating:
                     osc_gate = self.oscillatory_gating(block_idx, i)
-                    block_mod["residual_scale"] = block_mod.get("residual_scale", 1.0) * osc_gate
+                    base_residual_scale = block_mod.get("residual_scale")
+                    if base_residual_scale is None:
+                        base_residual_scale = osc_gate.new_tensor(1.0)
+                    elif not torch.is_tensor(base_residual_scale):
+                        base_residual_scale = osc_gate.new_tensor(float(base_residual_scale))
+                    else:
+                        base_residual_scale = base_residual_scale.to(device=osc_gate.device, dtype=osc_gate.dtype)
+                    block_mod["residual_scale"] = base_residual_scale * osc_gate
 
                 # Weight scale from depression
                 if "weight_scale" in modulation:
@@ -253,7 +265,7 @@ class NeuroModRecursiveModel(nn.Module):
 
         details = {
             "expected_iterations": expected_iterations,
-            "num_iterations": float(expected_iterations.detach().mean().item()),
+            "num_iterations": expected_iterations.detach().mean(),
             "iterations_executed": len(hidden_states),
             "halt_probs": halt_probs,
             "halt_distribution": halt_distribution,
@@ -289,13 +301,18 @@ def compute_loss(
         act_loss = remainder.mean()
 
     total_loss = task_loss + ponder_cost + 0.01 * act_loss
+    avg_iterations = details["num_iterations"]
+    if isinstance(avg_iterations, torch.Tensor):
+        avg_iterations = float(avg_iterations.detach().item())
+    else:
+        avg_iterations = float(avg_iterations)
 
     return total_loss, {
         "task_loss": task_loss.item(),
         "ponder_cost": float(ponder_cost.detach().item()),
         "act_loss": act_loss.item(),
         "total_loss": total_loss.item(),
-        "avg_iterations": details["num_iterations"],
+        "avg_iterations": avg_iterations,
     }
 
 

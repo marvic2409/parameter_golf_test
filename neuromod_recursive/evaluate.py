@@ -41,7 +41,10 @@ def evaluate_model(
         total_task_loss += loss_dict["task_loss"] * len(inputs)
         total_iterations += loss_dict["avg_iterations"] * len(inputs)
         total_samples += len(inputs)
-        iteration_counts.append(details["num_iterations"])
+        num_iterations = details["num_iterations"]
+        if isinstance(num_iterations, torch.Tensor):
+            num_iterations = float(num_iterations.detach().cpu().item())
+        iteration_counts.append(num_iterations)
 
     model.train()
 
