@@ -267,6 +267,9 @@ def setup_fineweb_eval(
     print(f"Loading validation tokens from {val_pattern}...")
     val_tokens = load_validation_tokens(val_pattern, seq_len)
     print(f"  Loaded {val_tokens.numel() - 1:,} validation tokens")
+    if device.type == "cuda":
+        print("  Caching validation tokens on GPU...")
+        val_tokens = val_tokens.to(device=device, dtype=torch.long)
 
     print(f"Loading tokenizer from {tokenizer_path}...")
     sp = spm.SentencePieceProcessor()

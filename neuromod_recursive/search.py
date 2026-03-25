@@ -205,8 +205,6 @@ def _rerank_archive_elites(
             seed_sizes.append(size_stats["zlib_compressed_bytes"])
             seed_iterations.append(result["avg_iterations"])
             del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         mean_score = sum(seed_scores) / len(seed_scores)
         variance = 0.0
@@ -397,8 +395,6 @@ def run_evolutionary_search(
 
             # Free model memory
             del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
             if not quiet:
                 mb = compressed_bytes / 1_000_000
@@ -438,8 +434,6 @@ def run_evolutionary_search(
             )
             entry["promoted"] = True
             del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             if not quiet:
                 print(
                     f"    promoted [{idx + 1}/{len(population)}] "
