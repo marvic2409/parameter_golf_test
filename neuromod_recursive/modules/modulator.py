@@ -91,32 +91,42 @@ class ModulatorNetwork(nn.Module):
             nn.init.zeros_(self.gate_head.weight)
             nn.init.constant_(self.gate_head.bias, 0.85)  # sigmoid(0.85) ≈ 0.7
 
-    def _sinusoidal_encoding(self, iteration: int, dim: int, device: torch.device) -> Tensor:
-        positions = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-        denom = torch.pow(10000.0, positions / dim)
-        phase = torch.full_like(positions, float(iteration)) / denom
-        pe = torch.zeros(dim, device=device, dtype=torch.float32)
-        pe[0::2] = torch.sin(phase)
-        pe[1::2] = torch.cos(phase[: pe[1::2].numel()])
-        return pe
+    def iteration_features(
+        self,
+        num_iterations: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
+    ) -> Tensor:
+        """Return projected iteration encodings as (num_iterations, mod_dim)."""
+        cfg = self.config
+        positions = torch.arange(0, cfg.mod_dim, 2, device=device, dtype=torch.float32)
+        denom = torch.pow(10000.0, positions / cfg.mod_dim)
+        iterations = torch.arange(num_iterations, device=device, dtype=torch.float32).unsqueeze(1)
+        phase = iterations / denom.unsqueeze(0)
+        pe = torch.zeros(num_iterations, cfg.mod_dim, device=device, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(phase)
+        pe[:, 1::2] = torch.cos(phase[:, : pe[:, 1::2].shape[1]])
+        projected = self.iter_proj(pe)
+        if dtype is not None:
+            projected = projected.to(dtype=dtype)
+        return projected
 
     def forward(
         self,
         input_summary: Tensor,     # (B, hidden_dim) — mean-pooled input embeddings
-        iteration: int,
         hidden_summary: Optional[Tensor] = None,  # (B, hidden_dim) — mean-pooled current hidden
+        iteration_features: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         cfg = self.config
         B = input_summary.shape[0]
-        device = input_summary.device
 
         # Build modulator input
         parts = [self.input_proj(input_summary)]  # (B, mod_dim)
 
         if cfg.use_iteration_encoding:
-            iter_enc = self._sinusoidal_encoding(iteration, cfg.mod_dim, device)
-            iter_enc = self.iter_proj(iter_enc).unsqueeze(0).expand(B, -1)
-            parts.append(iter_enc)
+            if iteration_features is None:
+                raise ValueError("iteration_features must be provided when iteration encoding is enabled")
+            parts.append(iteration_features.unsqueeze(0).expand(B, -1))
 
         if cfg.use_adaptive_modulation and hidden_summary is not None:
             parts.append(self.hidden_proj(hidden_summary))

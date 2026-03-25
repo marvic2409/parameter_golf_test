@@ -139,6 +139,13 @@ class NeuroModRecursiveModel(nn.Module):
         oscillation_schedule = None
         if cfg.use_oscillatory_gating:
             oscillation_schedule = self.oscillatory_gating.all_gates(cfg.max_iterations, dtype=h.dtype)
+        iteration_schedule = None
+        if cfg.use_iteration_encoding:
+            iteration_schedule = self.modulator.iteration_features(
+                cfg.max_iterations,
+                device=device,
+                dtype=input_summary.dtype,
+            )
 
         # 4. Recursive loop
         for i in range(cfg.max_iterations):
@@ -147,7 +154,12 @@ class NeuroModRecursiveModel(nn.Module):
 
             # 4b. Generate modulation
             hidden_summary = h.mean(dim=1) if cfg.use_adaptive_modulation else None
-            modulation = self.modulator(input_summary, i, hidden_summary)
+            iter_features = iteration_schedule[i] if iteration_schedule is not None else None
+            modulation = self.modulator(
+                input_summary,
+                hidden_summary=hidden_summary,
+                iteration_features=iter_features,
+            )
 
             # Clamp modulation outputs to safe ranges
             if "global_scale" in modulation:
