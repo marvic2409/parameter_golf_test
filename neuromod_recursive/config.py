@@ -286,4 +286,18 @@ def make_preset_config(name: str) -> NeuroModConfig:
         cfg.min_lr_ratio = 0.08
         cfg.iteration_cost = 0.005
         return cfg
+    if name == "fineweb_competitive":
+        cfg.hidden_dim = 640
+        cfg.num_heads = 10
+        cfg.ff_mult = 3.0
+        cfg.mod_dim = 32
+        cfg.num_shared_blocks = 3
+        cfg.max_iterations = 4
+        cfg.batch_size = 6
+        cfg.lr = 1.2e-4
+        cfg.warmup_steps = 700
+        cfg.num_cycles = 3
+        cfg.min_lr_ratio = 0.08
+        cfg.iteration_cost = 0.003
+        return cfg
     raise ValueError(f"unknown preset {name!r}")

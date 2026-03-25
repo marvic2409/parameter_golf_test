@@ -38,8 +38,18 @@ def parse_args():
     parser.add_argument("--population", type=int, default=30, help="Population size per generation")
     parser.add_argument("--generations", type=int, default=20, help="Number of generations")
     parser.add_argument("--steps", type=int, default=2000, help="Training steps per evaluation")
-    parser.add_argument("--novelty-weight", type=float, default=0.5, help="Initial novelty weight")
+    parser.add_argument("--novelty-weight", type=float, default=0.2, help="Initial novelty weight")
+    parser.add_argument("--novelty-end-weight", type=float, default=0.05, help="Final novelty weight after annealing")
     parser.add_argument("--novelty-k", type=int, default=15, help="k for k-nearest novelty")
+    parser.add_argument(
+        "--novelty-transform",
+        choices=["identity", "log1p", "sqrt", "clamp2"],
+        default="log1p",
+        help="Transform applied to raw novelty before fitness weighting.",
+    )
+    parser.add_argument("--fitness-efficiency-weight", type=float, default=0.02, help="Penalty weight for average iterations in search fitness")
+    parser.add_argument("--fitness-simplicity-weight", type=float, default=0.01, help="Penalty weight for active mechanisms in search fitness")
+    parser.add_argument("--fitness-quant-penalty", type=float, default=1.0, help="Penalty weight for post-quant degradation in search fitness")
     parser.add_argument("--mutation-boolean-prob", type=float, default=0.15, help="Base mutation probability for boolean genes")
     parser.add_argument("--mutation-continuous-prob", type=float, default=0.20, help="Base mutation probability for continuous genes")
     parser.add_argument("--mutation-continuous-scale", type=float, default=0.10, help="Gaussian mutation scale as a fraction of each continuous range")
@@ -61,7 +71,7 @@ def parse_args():
         "--preset",
         type=str,
         default="default",
-        choices=["default", "fineweb_medium", "fineweb_large"],
+        choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive"],
         help="Base config preset before applying any explicit overrides.",
     )
 
@@ -114,6 +124,7 @@ def parse_args():
     # Staged search controls.
     parser.add_argument("--screen-val-seqs", type=int, default=None, help="Validation sequences for cheap screening eval")
     parser.add_argument("--promote-top-k", type=int, default=None, help="Promote top-K screen candidates each generation")
+    parser.add_argument("--quality-promote-top-k", type=int, default=None, help="Reserve this many promotion slots for the lowest raw screen score")
     parser.add_argument("--promote-val-seqs", type=int, default=None, help="Validation sequences for promoted candidates")
     parser.add_argument("--elite-rerank-top-k", type=int, default=None, help="Final archive elites to retrain from scratch")
     parser.add_argument("--elite-rerank-steps", type=int, default=None, help="Training steps for elite reranking")
@@ -199,6 +210,8 @@ def main():
             args.promote_val_seqs = min(4096, total_val_seqs)
         if args.promote_top_k is None:
             args.promote_top_k = max(1, args.population // 5)
+        if args.quality_promote_top_k is None:
+            args.quality_promote_top_k = min(1, args.promote_top_k)
         if args.elite_rerank_top_k is None:
             args.elite_rerank_top_k = min(3, args.population)
         if args.elite_rerank_steps is None:
@@ -206,6 +219,8 @@ def main():
     else:
         if args.promote_top_k is None:
             args.promote_top_k = 0
+        if args.quality_promote_top_k is None:
+            args.quality_promote_top_k = 0
         if args.elite_rerank_top_k is None:
             args.elite_rerank_top_k = 0
 
@@ -281,10 +296,16 @@ def main():
         f"cont_scale={mutation_settings.continuous_scale:.2f}, cat={mutation_settings.categorical_prob:.2f}) "
         f"immigrants={args.random_immigrants} archive_samples={args.archive_samples}"
     )
+    print(
+        f"Fitness: novelty={args.novelty_weight:.2f}->{args.novelty_end_weight:.2f} "
+        f"transform={args.novelty_transform} eff={args.fitness_efficiency_weight:.2f} "
+        f"simplicity={args.fitness_simplicity_weight:.2f} quant={args.fitness_quant_penalty:.2f}"
+    )
     if fineweb_setup:
         print(
             f"Staged eval: screen={args.screen_val_seqs} seqs | "
-            f"promote_top_k={args.promote_top_k} promote_eval={args.promote_val_seqs} seqs | "
+            f"promote_top_k={args.promote_top_k} quality_promote={args.quality_promote_top_k} "
+            f"promote_eval={args.promote_val_seqs} seqs | "
             f"elite_top_k={args.elite_rerank_top_k} elite_steps={args.elite_rerank_steps} "
             f"elite_seeds={args.elite_rerank_seeds}"
         )
@@ -306,6 +327,7 @@ def main():
         search_space=args.search_space,
         screen_val_sequences=args.screen_val_seqs,
         promote_top_k=args.promote_top_k,
+        quality_promote_top_k=args.quality_promote_top_k,
         promote_val_sequences=args.promote_val_seqs,
         elite_rerank_top_k=args.elite_rerank_top_k,
         elite_rerank_steps=args.elite_rerank_steps,
@@ -317,6 +339,11 @@ def main():
         mutation_settings=mutation_settings,
         exploration_start=args.exploration_start,
         exploration_end=args.exploration_end,
+        novelty_end_weight=args.novelty_end_weight,
+        novelty_transform=args.novelty_transform,
+        fitness_efficiency_weight=args.fitness_efficiency_weight,
+        fitness_simplicity_weight=args.fitness_simplicity_weight,
+        fitness_quant_penalty=args.fitness_quant_penalty,
         random_immigrants=args.random_immigrants,
         archive_samples=args.archive_samples,
     )
