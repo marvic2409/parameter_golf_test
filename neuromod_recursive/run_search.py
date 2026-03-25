@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from .config import NeuroModConfig, SEARCH_SPACE_SPECS, make_preset_config
+from .config import MutationSettings, NeuroModConfig, SEARCH_SPACE_SPECS, make_preset_config
 from .model import NeuroModRecursiveModel, count_parameters
 from .search import run_evolutionary_search
 from .train import train_single_config, train_distributed
@@ -40,6 +40,14 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=2000, help="Training steps per evaluation")
     parser.add_argument("--novelty-weight", type=float, default=0.5, help="Initial novelty weight")
     parser.add_argument("--novelty-k", type=int, default=15, help="k for k-nearest novelty")
+    parser.add_argument("--mutation-boolean-prob", type=float, default=0.15, help="Base mutation probability for boolean genes")
+    parser.add_argument("--mutation-continuous-prob", type=float, default=0.20, help="Base mutation probability for continuous genes")
+    parser.add_argument("--mutation-continuous-scale", type=float, default=0.10, help="Gaussian mutation scale as a fraction of each continuous range")
+    parser.add_argument("--mutation-categorical-prob", type=float, default=0.10, help="Base mutation probability for categorical genes")
+    parser.add_argument("--exploration-start", type=float, default=1.5, help="Exploration multiplier at generation 1")
+    parser.add_argument("--exploration-end", type=float, default=0.75, help="Exploration multiplier at the final generation")
+    parser.add_argument("--random-immigrants", type=int, default=None, help="Fresh random architectures injected each generation before annealing")
+    parser.add_argument("--archive-samples", type=int, default=None, help="Mutated archive samples injected each generation")
     parser.add_argument("--seed", type=int, default=42, help="Master random seed")
     parser.add_argument("--output-dir", type=str, default="search_results", help="Output directory")
     parser.add_argument(
@@ -157,6 +165,12 @@ def main():
     base_config = build_base_config(args)
     compile_search_candidates = args.compile_model and args.compile_search_candidates
     compile_elite_rerank = args.compile_model
+    mutation_settings = MutationSettings(
+        boolean_prob=args.mutation_boolean_prob,
+        continuous_prob=args.mutation_continuous_prob,
+        continuous_scale=args.mutation_continuous_scale,
+        categorical_prob=args.mutation_categorical_prob,
+    )
 
     print(f"Device: {device}")
     if torch.cuda.is_available():
@@ -194,6 +208,11 @@ def main():
             args.promote_top_k = 0
         if args.elite_rerank_top_k is None:
             args.elite_rerank_top_k = 0
+
+    if args.random_immigrants is None:
+        args.random_immigrants = 1 if args.population >= 8 else 0
+    if args.archive_samples is None:
+        args.archive_samples = max(2, args.population // 10)
 
     preview_config = NeuroModConfig(**vars(base_config))
     if fineweb_setup:
@@ -256,6 +275,12 @@ def main():
     print(f"Search space: {args.search_space} | AMP: {args.amp_dtype} | compile={compile_mode}")
     if args.compile_model and not compile_search_candidates:
         print("Compile note: mutated search candidates stay eager to avoid CPU-bound torch.compile churn.")
+    print(
+        f"Exploration: start={args.exploration_start:.2f} end={args.exploration_end:.2f} "
+        f"mutate(bool={mutation_settings.boolean_prob:.2f}, cont={mutation_settings.continuous_prob:.2f}, "
+        f"cont_scale={mutation_settings.continuous_scale:.2f}, cat={mutation_settings.categorical_prob:.2f}) "
+        f"immigrants={args.random_immigrants} archive_samples={args.archive_samples}"
+    )
     if fineweb_setup:
         print(
             f"Staged eval: screen={args.screen_val_seqs} seqs | "
@@ -289,6 +314,11 @@ def main():
         amp_dtype=args.amp_dtype,
         compile_model=compile_elite_rerank,
         compile_search_candidates=compile_search_candidates,
+        mutation_settings=mutation_settings,
+        exploration_start=args.exploration_start,
+        exploration_end=args.exploration_end,
+        random_immigrants=args.random_immigrants,
+        archive_samples=args.archive_samples,
     )
     total_time = time.time() - t0
 

@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from .utils import export_state_dict, unwrap_model
+
 
 # Thresholds matching train_gpt.py
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
@@ -130,15 +132,10 @@ def dequantize_state_dict_int8(obj: dict) -> dict[str, Tensor]:
     return out
 
 
-def measure_compressed_size(model: nn.Module) -> dict:
-    """Quantize + zlib compress a model and report sizes.
-
-    This is what the challenge actually measures.
-    """
-    state_dict = model.state_dict()
+def quantize_and_measure_state_dict(state_dict: dict[str, Tensor]) -> tuple[dict, dict]:
+    """Quantize and compress a state dict, returning both the object and size stats."""
     quant_obj, stats = quantize_state_dict_int8(state_dict)
 
-    # Serialize and compress
     buf = io.BytesIO()
     torch.save(quant_obj, buf)
     raw_bytes = buf.getvalue()
@@ -147,7 +144,20 @@ def measure_compressed_size(model: nn.Module) -> dict:
     stats["raw_quant_bytes"] = len(raw_bytes)
     stats["zlib_compressed_bytes"] = len(compressed)
     stats["under_16mb"] = len(compressed) < 16_000_000
+    return quant_obj, stats
 
+
+def quantize_and_measure_model(model: nn.Module) -> tuple[dict, dict]:
+    """Quantize and compress a model once, suitable for export and reload."""
+    return quantize_and_measure_state_dict(export_state_dict(model))
+
+
+def measure_compressed_size(model: nn.Module) -> dict:
+    """Quantize + zlib compress a model and report sizes.
+
+    This is what the challenge actually measures.
+    """
+    _, stats = quantize_and_measure_model(model)
     return stats
 
 
@@ -170,12 +180,12 @@ def quantize_roundtrip_eval(
     pre_result = eval_fn(model=model, **eval_kwargs)
 
     # Quantize and dequantize
-    state_dict = model.state_dict()
-    quant_obj, _ = quantize_state_dict_int8(state_dict)
+    base_model = unwrap_model(model)
+    quant_obj, _ = quantize_and_measure_model(base_model)
     dequant_state = dequantize_state_dict_int8(quant_obj)
 
     # Load dequantized weights
-    model.load_state_dict(dequant_state)
+    base_model.load_state_dict(dequant_state)
 
     # Post-quantization eval
     post_result = eval_fn(model=model, **eval_kwargs)

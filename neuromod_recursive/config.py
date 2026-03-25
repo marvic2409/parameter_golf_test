@@ -1,10 +1,10 @@
-"""Configuration dataclass — the 'genome' that the evolutionary search mutates."""
+"""Configuration dataclass - the "genome" that the evolutionary search mutates."""
 
 from __future__ import annotations
 
 import copy
 import random
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 
 
 @dataclass
@@ -77,6 +77,23 @@ class NeuroModConfig:
         ])
 
 
+@dataclass(frozen=True)
+class MutationSettings:
+    boolean_prob: float = 0.15
+    continuous_prob: float = 0.20
+    continuous_scale: float = 0.10
+    categorical_prob: float = 0.10
+
+    def scaled(self, multiplier: float) -> "MutationSettings":
+        multiplier = max(0.0, multiplier)
+        return MutationSettings(
+            boolean_prob=min(1.0, self.boolean_prob * multiplier),
+            continuous_prob=min(1.0, self.continuous_prob * multiplier),
+            continuous_scale=min(1.0, self.continuous_scale * multiplier),
+            categorical_prob=min(1.0, self.categorical_prob * multiplier),
+        )
+
+
 # --- Evolutionary search parameter definitions ---
 
 BOOLEAN_PARAMS = [
@@ -146,21 +163,26 @@ def get_search_space_spec(search_space: str = "all") -> dict[str, list[str]]:
     return SEARCH_SPACE_SPECS[search_space]
 
 
-def mutate(config: NeuroModConfig, search_space: str = "all") -> NeuroModConfig:
+def mutate(
+    config: NeuroModConfig,
+    search_space: str = "all",
+    settings: MutationSettings | None = None,
+) -> NeuroModConfig:
     cfg = copy.deepcopy(config)
     spec = get_search_space_spec(search_space)
+    settings = settings or MutationSettings()
     for param in spec["boolean"]:
-        if random.random() < 0.15:
+        if random.random() < settings.boolean_prob:
             setattr(cfg, param, not getattr(cfg, param))
     for param in spec["continuous"]:
         lo, hi = CONTINUOUS_PARAMS[param]
-        if random.random() < 0.20:
+        if random.random() < settings.continuous_prob:
             val = getattr(cfg, param)
-            noise = random.gauss(0, 0.1 * (hi - lo))
+            noise = random.gauss(0, settings.continuous_scale * (hi - lo))
             setattr(cfg, param, max(lo, min(hi, val + noise)))
     for param in spec["categorical"]:
         choices = CATEGORICAL_PARAMS[param]
-        if random.random() < 0.10:
+        if random.random() < settings.categorical_prob:
             setattr(cfg, param, random.choice(choices))
     return cfg
 

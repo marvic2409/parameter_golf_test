@@ -104,6 +104,24 @@ def maybe_compile_model(model: torch.nn.Module, enabled: bool) -> torch.nn.Modul
     return compile_fn(model, mode="reduce-overhead")
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "_orig_mod", model)
+
+
+def canonicalize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    prefix = "_orig_mod."
+    if not any(name.startswith(prefix) for name in state_dict):
+        return state_dict
+    return {
+        (name[len(prefix):] if name.startswith(prefix) else name): tensor
+        for name, tensor in state_dict.items()
+    }
+
+
+def export_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return canonicalize_state_dict(unwrap_model(model).state_dict())
+
+
 def format_param_count(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"

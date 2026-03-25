@@ -18,12 +18,12 @@ from typing import Optional
 import torch
 
 from .config import (
-    NeuroModConfig, mutate, crossover,
+    MutationSettings, NeuroModConfig, mutate, crossover,
     make_all_on_config, make_minimal_config,
     make_modulation_only_config, make_halting_only_config,
     make_random_config, BOOLEAN_PARAMS,
 )
-from .compression import measure_compressed_size, quantize_state_dict_int8, dequantize_state_dict_int8
+from .compression import dequantize_state_dict_int8, quantize_and_measure_model
 from .model import NeuroModRecursiveModel
 from .train import evaluate_trained_model, train_single_config
 from .evaluate import evaluate_model
@@ -33,7 +33,7 @@ from .novelty.behavioral import (
 from .novelty.map_elites import MAPElitesArchive
 from .novelty.speciation import SpeciationManager
 from .novelty.novelty import compute_novelty
-from .utils import config_to_dict, get_device, set_seed
+from .utils import config_to_dict, export_state_dict, get_device, set_seed
 
 
 def compute_composite_fitness(
@@ -99,7 +99,7 @@ def _score_from_eval_result(eval_result: dict) -> float:
 def _snapshot_state_dict_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {
         name: tensor.detach().to(device="cpu").clone()
-        for name, tensor in model.state_dict().items()
+        for name, tensor in export_state_dict(model).items()
     }
 
 
@@ -156,6 +156,11 @@ def _seed_population(
     return population[:population_size]
 
 
+def _linear_schedule(start: float, end: float, progress: float) -> float:
+    progress = min(max(progress, 0.0), 1.0)
+    return start + (end - start) * progress
+
+
 def _rerank_archive_elites(
     archive: MAPElitesArchive,
     top_k: int,
@@ -190,8 +195,7 @@ def _rerank_archive_elites(
                 compile_model=compile_model,
             )
             model = result["model"]
-            size_stats = measure_compressed_size(model)
-            quant_obj, _ = quantize_state_dict_int8(model.state_dict())
+            quant_obj, size_stats = quantize_and_measure_model(model)
             dequant_state = dequantize_state_dict_int8(quant_obj)
             model.load_state_dict(dequant_state)
             eval_result = evaluate_trained_model(
@@ -249,6 +253,11 @@ def run_evolutionary_search(
     amp_dtype: str | None = None,
     compile_model: bool = False,
     compile_search_candidates: bool = False,
+    mutation_settings: MutationSettings | None = None,
+    exploration_start: float = 1.5,
+    exploration_end: float = 0.75,
+    random_immigrants: int = 0,
+    archive_samples: Optional[int] = None,
 ) -> MAPElitesArchive:
     """Run the full evolutionary search with MAP-Elites + speciation + novelty."""
     set_seed(seed)
@@ -262,6 +271,9 @@ def run_evolutionary_search(
     promote_top_k = min(max(promote_top_k, 0), population_size)
     elite_rerank_top_k = max(elite_rerank_top_k, 0)
     elite_rerank_steps = elite_rerank_steps or max(training_steps_per_eval * 2, training_steps_per_eval)
+    mutation_settings = mutation_settings or MutationSettings()
+    archive_samples = max(0, archive_samples if archive_samples is not None else max(2, population_size // 10))
+    random_immigrants = max(0, random_immigrants)
 
     # If using FineWeb, override vocab/seq in all configs
     fw_vocab = fineweb_setup["vocab_size"] if fineweb_setup else None
@@ -289,6 +301,15 @@ def run_evolutionary_search(
 
     for gen in range(num_generations):
         gen_start = time.time()
+        progress = 0.0 if num_generations <= 1 else gen / (num_generations - 1)
+        exploration_multiplier = _linear_schedule(exploration_start, exploration_end, progress)
+        active_mutation = mutation_settings.scaled(exploration_multiplier)
+        elite_count = min(2, population_size)
+        active_archive_samples = min(archive_samples, max(0, population_size - elite_count))
+        active_random_immigrants = min(
+            max(0, int(round(random_immigrants * exploration_multiplier))),
+            max(0, population_size - elite_count - active_archive_samples),
+        )
         results = []
         promoted_heap: list[tuple[float, int]] = []
         promoted_snapshots: dict[int, dict[str, torch.Tensor]] = {}
@@ -298,6 +319,14 @@ def run_evolutionary_search(
             print(f"\n{'='*60}")
             print(f"Generation {gen + 1}/{num_generations}")
             print(f"{'='*60}")
+            print(
+                f"  exploration={exploration_multiplier:.2f} "
+                f"mutate(bool={active_mutation.boolean_prob:.2f}, "
+                f"cont={active_mutation.continuous_prob:.2f}, "
+                f"cont_scale={active_mutation.continuous_scale:.2f}, "
+                f"cat={active_mutation.categorical_prob:.2f}) "
+                f"immigrants={active_random_immigrants} archive_samples={active_archive_samples}"
+            )
 
         for idx, config in enumerate(population):
             eval_start = time.time()
@@ -324,12 +353,11 @@ def run_evolutionary_search(
             avg_iters = train_result["avg_iterations"]
 
             # --- Challenge constraint checks ---
-            # 1. Measure compressed size
-            size_stats = measure_compressed_size(model)
+            # 1. Quantize once and reuse the object for size measurement and reload.
+            quant_obj, size_stats = quantize_and_measure_model(model)
             compressed_bytes = size_stats["zlib_compressed_bytes"]
 
             # 2. Quantization roundtrip: evaluate AFTER int8 quantize+dequantize
-            quant_obj, _ = quantize_state_dict_int8(model.state_dict())
             dequant_state = dequantize_state_dict_int8(quant_obj)
             model.load_state_dict(dequant_state)
 
@@ -479,6 +507,13 @@ def run_evolutionary_search(
             "novelty_weight": novelty_weight,
             "promoted_count": sum(1 for entry in results if entry["promoted"]),
             "search_space": search_space,
+            "exploration_multiplier": exploration_multiplier,
+            "mutation_boolean_prob": active_mutation.boolean_prob,
+            "mutation_continuous_prob": active_mutation.continuous_prob,
+            "mutation_continuous_scale": active_mutation.continuous_scale,
+            "mutation_categorical_prob": active_mutation.categorical_prob,
+            "random_immigrants": active_random_immigrants,
+            "archive_samples": active_archive_samples,
         }
         generation_logs.append(gen_log)
         coverage_history.append(archive_stats["coverage"])
@@ -491,13 +526,15 @@ def run_evolutionary_search(
             print(f"    Time: {gen_time:.0f}s")
 
         # --- Selection and reproduction ---
-        offspring_allocation = speciation_mgr.allocate_offspring(population_size - 2)
+        species_budget = max(0, population_size - elite_count - active_archive_samples - active_random_immigrants)
+        offspring_allocation = speciation_mgr.allocate_offspring(species_budget)
         new_population = []
 
-        # Elitism: carry top 2 from archive
-        top_configs = archive.best_configs(2)
+        # Elitism: carry top archive members forward unchanged.
+        top_configs = archive.best_configs(elite_count)
         for cfg, _, _ in top_configs:
             new_population.append(copy.deepcopy(cfg))
+        species_target_size = elite_count + species_budget
 
         # Per-species reproduction
         for species, num_offspring in offspring_allocation.items():
@@ -512,27 +549,52 @@ def run_evolutionary_search(
                 continue
 
             for _ in range(num_offspring):
+                if len(new_population) >= species_target_size:
+                    break
                 if len(members_ranked) >= 2 and random.random() < 0.7:
                     p1 = tournament_select(members_ranked, k=3)
                     p2 = tournament_select(members_ranked, k=3)
                     child = crossover(p1, p2)
                 else:
                     parent = tournament_select(members_ranked, k=3)
-                    child = mutate(parent, search_space=search_space)
+                    child = mutate(parent, search_space=search_space, settings=active_mutation)
 
-                child = mutate(child, search_space=search_space)
+                child = mutate(child, search_space=search_space, settings=active_mutation)
                 new_population.append(child)
+            if len(new_population) >= species_target_size:
+                break
 
-        # Inject archive samples for exploration
-        num_archive_samples = max(2, population_size // 10)
-        for _ in range(num_archive_samples):
+        while len(new_population) < species_target_size:
             if archive.grid:
                 parent = archive.sample_parent()
-                child = mutate(
-                    mutate(copy.deepcopy(parent), search_space=search_space),
-                    search_space=search_space,
-                )
-                new_population.append(child)
+                child = mutate(copy.deepcopy(parent), search_space=search_space, settings=active_mutation)
+            else:
+                child = make_random_config(seed_config, search_space=search_space)
+            new_population.append(child)
+
+        archive_target_size = species_target_size + active_archive_samples
+        while len(new_population) < archive_target_size:
+            if not archive.grid:
+                break
+            parent = archive.sample_parent()
+            child = mutate(
+                mutate(copy.deepcopy(parent), search_space=search_space, settings=active_mutation),
+                search_space=search_space,
+                settings=active_mutation,
+            )
+            new_population.append(child)
+
+        immigrant_target_size = archive_target_size + active_random_immigrants
+        while len(new_population) < immigrant_target_size:
+            new_population.append(make_random_config(seed_config, search_space=search_space))
+
+        while len(new_population) < population_size:
+            if archive.grid:
+                parent = archive.sample_parent()
+                child = mutate(copy.deepcopy(parent), search_space=search_space, settings=active_mutation)
+            else:
+                child = make_random_config(seed_config, search_space=search_space)
+            new_population.append(child)
 
         population = new_population[:population_size]
 

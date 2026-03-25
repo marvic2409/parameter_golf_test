@@ -24,7 +24,7 @@ from pathlib import Path
 
 import torch
 
-from .compression import dequantize_state_dict_int8, measure_compressed_size, quantize_state_dict_int8
+from .compression import dequantize_state_dict_int8, quantize_and_measure_model
 from .config import NeuroModConfig, make_preset_config
 from .model import NeuroModRecursiveModel, count_parameters
 from .novelty.behavioral import compute_behavioral_profile, generate_diagnostic_probes
@@ -239,13 +239,12 @@ def main() -> None:
 
     sync_device(device)
     t_comp0 = time.perf_counter()
-    size_stats = measure_compressed_size(model)
+    quant_obj, size_stats = quantize_and_measure_model(model)
     sync_device(device)
     compression_s = time.perf_counter() - t_comp0
 
     sync_device(device)
     t_quant0 = time.perf_counter()
-    quant_obj, _ = quantize_state_dict_int8(model.state_dict())
     dequant_state = dequantize_state_dict_int8(quant_obj)
     model.load_state_dict(dequant_state)
     sync_device(device)
@@ -335,13 +334,12 @@ def main() -> None:
         )
         sync_device(device)
         t_rerank_comp0 = time.perf_counter()
-        rerank_size_stats = measure_compressed_size(rerank_model)
+        rerank_quant_obj, rerank_size_stats = quantize_and_measure_model(rerank_model)
         sync_device(device)
         rerank_comp_s = time.perf_counter() - t_rerank_comp0
 
         sync_device(device)
         t_rerank_quant0 = time.perf_counter()
-        rerank_quant_obj, _ = quantize_state_dict_int8(rerank_model.state_dict())
         rerank_dequant_state = dequantize_state_dict_int8(rerank_quant_obj)
         rerank_model.load_state_dict(rerank_dequant_state)
         sync_device(device)

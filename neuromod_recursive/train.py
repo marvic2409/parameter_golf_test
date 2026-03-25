@@ -31,6 +31,7 @@ from .utils import (
     maybe_compile_model,
     normalize_amp_dtype,
     set_seed,
+    unwrap_model,
 )
 
 
@@ -292,6 +293,7 @@ def train_single_config(
         eval_batches=eval_batches,
         amp_dtype=amp_dtype,
     )
+    exported_model = unwrap_model(model)
 
     if final_eval_setup is not None:
         result = {
@@ -302,7 +304,7 @@ def train_single_config(
             "train_loss_final": train_losses[-1] if train_losses else float("inf"),
             "n_params": n_params,
             "elapsed_seconds": elapsed,
-            "model": model,
+            "model": exported_model,
         }
         if not quiet:
             print(f"\n  Final: val_loss={result['val_loss']:.4f} | val_bpb={result['val_bpb']:.4f} | "
@@ -316,7 +318,7 @@ def train_single_config(
             "train_loss_final": train_losses[-1] if train_losses else float("inf"),
             "n_params": n_params,
             "elapsed_seconds": elapsed,
-            "model": model,
+            "model": exported_model,
         }
         if not quiet:
             print(f"\n  Final: val_loss={result['val_loss']:.4f} | "
