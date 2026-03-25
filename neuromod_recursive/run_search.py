@@ -92,7 +92,16 @@ def parse_args():
         choices=["none", "bf16", "fp16"],
         help="Autocast dtype for CUDA training/eval.",
     )
-    parser.add_argument("--compile-model", action="store_true", help="Use torch.compile on non-DDP model training")
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Use torch.compile on fixed-shape training paths (single runs and elite rerank in search mode).",
+    )
+    parser.add_argument(
+        "--compile-search-candidates",
+        action="store_true",
+        help="Also compile every mutated search candidate. Usually slower due to per-candidate compile overhead.",
+    )
 
     # Staged search controls.
     parser.add_argument("--screen-val-seqs", type=int, default=None, help="Validation sequences for cheap screening eval")
@@ -146,6 +155,8 @@ def main():
     else:
         device = get_device()
     base_config = build_base_config(args)
+    compile_search_candidates = args.compile_model and args.compile_search_candidates
+    compile_elite_rerank = args.compile_model
 
     print(f"Device: {device}")
     if torch.cuda.is_available():
@@ -236,7 +247,15 @@ def main():
     print(f"\n--- Evolutionary Search ---")
     print(f"Population: {args.population} | Generations: {args.generations}")
     print(f"Steps/eval: {args.steps} | Novelty weight: {args.novelty_weight}")
-    print(f"Search space: {args.search_space} | AMP: {args.amp_dtype} | compile={args.compile_model}")
+    if compile_search_candidates:
+        compile_mode = "all-candidates"
+    elif compile_elite_rerank:
+        compile_mode = "rerank-only"
+    else:
+        compile_mode = "off"
+    print(f"Search space: {args.search_space} | AMP: {args.amp_dtype} | compile={compile_mode}")
+    if args.compile_model and not compile_search_candidates:
+        print("Compile note: mutated search candidates stay eager to avoid CPU-bound torch.compile churn.")
     if fineweb_setup:
         print(
             f"Staged eval: screen={args.screen_val_seqs} seqs | "
@@ -268,7 +287,8 @@ def main():
         elite_rerank_seeds=args.elite_rerank_seeds,
         elite_val_sequences=args.elite_val_seqs,
         amp_dtype=args.amp_dtype,
-        compile_model=args.compile_model,
+        compile_model=compile_elite_rerank,
+        compile_search_candidates=compile_search_candidates,
     )
     total_time = time.time() - t0
 

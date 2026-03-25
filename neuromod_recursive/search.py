@@ -248,6 +248,7 @@ def run_evolutionary_search(
     elite_val_sequences: Optional[int] = None,
     amp_dtype: str | None = None,
     compile_model: bool = False,
+    compile_search_candidates: bool = False,
 ) -> MAPElitesArchive:
     """Run the full evolutionary search with MAP-Elites + speciation + novelty."""
     set_seed(seed)
@@ -316,7 +317,7 @@ def run_evolutionary_search(
                 fineweb_setup=fineweb_setup,
                 eval_setup=eval_stages["screen"],
                 amp_dtype=amp_dtype,
-                compile_model=compile_model,
+                compile_model=compile_search_candidates,
             )
             model = train_result["model"]
             score_pre = train_result["val_bpb"] if train_result.get("val_bpb") is not None else train_result["val_loss"]

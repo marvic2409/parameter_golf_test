@@ -48,6 +48,11 @@ def parse_args():
     parser.add_argument("--target-probes", type=int, default=500, help="Probe count used in the real search")
     parser.add_argument("--amp-dtype", choices=["none", "bf16", "fp16"], default="bf16")
     parser.add_argument("--compile-model", action="store_true")
+    parser.add_argument(
+        "--compile-search-candidates",
+        action="store_true",
+        help="Also compile the screened search candidate. Usually not worthwhile for evolutionary search.",
+    )
     parser.add_argument("--screen-val-seqs", type=int, default=None)
     parser.add_argument("--promote-top-k", type=int, default=None)
     parser.add_argument("--promote-val-seqs", type=int, default=None)
@@ -152,6 +157,8 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device) if args.device is not None else get_device()
     config = build_config(args)
+    compile_search_candidates = args.compile_model and args.compile_search_candidates
+    compile_elite_rerank = args.compile_model
     fineweb_setup = None
     eval_stages = {"screen": None, "promote": None, "elite": None}
 
@@ -196,7 +203,8 @@ def main() -> None:
 
     print(
         f"Benchmarking preset={args.preset} device={device} "
-        f"params={format_param_count(param_count)} steps={args.steps} search_steps={args.search_steps}"
+        f"params={format_param_count(param_count)} steps={args.steps} search_steps={args.search_steps} "
+        f"compile={'all-candidates' if compile_search_candidates else ('rerank-only' if compile_elite_rerank else 'off')}"
     )
 
     sync_device(device)
@@ -209,7 +217,7 @@ def main() -> None:
         fineweb_setup=fineweb_setup,
         eval_setup=eval_stages["screen"],
         amp_dtype=args.amp_dtype,
-        compile_model=args.compile_model,
+        compile_model=compile_search_candidates,
     )
     sync_device(device)
     train_plus_eval_s = time.perf_counter() - t_train0
@@ -314,7 +322,7 @@ def main() -> None:
             fineweb_setup=fineweb_setup,
             eval_setup=eval_stages["elite"],
             amp_dtype=args.amp_dtype,
-            compile_model=args.compile_model,
+            compile_model=compile_elite_rerank,
         )
         rerank_model = rerank_result["model"]
         _, rerank_pre_eval_s, rerank_tokens, _ = timed_eval(
@@ -378,6 +386,8 @@ def main() -> None:
         "use_fineweb": args.use_fineweb,
         "amp_dtype": args.amp_dtype,
         "compile_model": args.compile_model,
+        "compile_search_candidates": compile_search_candidates,
+        "compile_elite_rerank": compile_elite_rerank,
         "param_count": param_count,
         "benchmark_steps": args.steps,
         "search_steps": args.search_steps,
