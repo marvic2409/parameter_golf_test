@@ -131,6 +131,14 @@ class NeuroModRecursiveModel(nn.Module):
         hidden_states = []
         halt_probs = []
         iteration_details = []
+        depression_schedule = None
+        if cfg.use_synaptic_depression:
+            exponents = torch.arange(cfg.max_iterations, device=device, dtype=h.dtype)
+            base = h.new_tensor(1.0 - self.synaptic_depression.depression_rate)
+            depression_schedule = torch.pow(base, exponents)
+        oscillation_schedule = None
+        if cfg.use_oscillatory_gating:
+            oscillation_schedule = self.oscillatory_gating.all_gates(cfg.max_iterations, dtype=h.dtype)
 
         # 4. Recursive loop
         for i in range(cfg.max_iterations):
@@ -153,7 +161,7 @@ class NeuroModRecursiveModel(nn.Module):
 
             # 4c. Apply synaptic depression
             if cfg.use_synaptic_depression:
-                depression_mult = h.new_tensor(self.synaptic_depression(i))
+                depression_mult = depression_schedule[i]
                 base_weight_scale = modulation.get("weight_scale")
                 if base_weight_scale is None:
                     base_weight_scale = depression_mult.new_tensor(1.0)
@@ -168,7 +176,7 @@ class NeuroModRecursiveModel(nn.Module):
 
                 # Oscillatory gating
                 if cfg.use_oscillatory_gating:
-                    osc_gate = self.oscillatory_gating(block_idx, i)
+                    osc_gate = oscillation_schedule[i, block_idx]
                     base_residual_scale = block_mod.get("residual_scale")
                     if base_residual_scale is None:
                         base_residual_scale = osc_gate.new_tensor(1.0)
