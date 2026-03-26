@@ -20,7 +20,7 @@ import torch
 from .config import (
     MutationSettings, NeuroModConfig, mutate, crossover,
     make_all_on_config, make_minimal_config,
-    make_modulation_only_config, make_halting_only_config,
+    make_modulation_only_config, make_halting_only_config, make_deep_recursion_config,
     make_random_config, BOOLEAN_PARAMS,
 )
 from .compression import dequantize_state_dict_int8, quantize_and_measure_model
@@ -163,6 +163,7 @@ def _seed_population(
         population.append(make_modulation_only_config(base_config, search_space=search_space))
     if search_space != "modulation_only":
         population.append(make_halting_only_config(base_config, search_space=search_space))
+    population.append(make_deep_recursion_config(base_config, search_space=search_space))
     while len(population) < population_size:
         population.append(make_random_config(base_config, search_space=search_space))
     return population[:population_size]
@@ -341,7 +342,7 @@ def run_evolutionary_search(
     training_steps_per_eval: int = 2000,
     novelty_k: int = 15,
     novelty_weight: float = 0.5,
-    seed: int = 42,
+    seed: int = 420,
     output_dir: str = "search_results",
     device: Optional[torch.device] = None,
     quiet: bool = False,

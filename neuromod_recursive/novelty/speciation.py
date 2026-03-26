@@ -27,7 +27,8 @@ def structural_distance(cfg1: NeuroModConfig, cfg2: NeuroModConfig) -> float:
         "attractor_threshold": (0.001, 0.1),
         "depression_rate": (0.01, 0.2),
         "energy_budget": (0.5, 2.0),
-        "max_iterations": (3, 8),
+        "max_iterations": (3, 12),
+        "min_iterations_before_halt": (1, 8),
         "num_shared_blocks": (1, 3),
     }
     for param, (lo, hi) in continuous.items():

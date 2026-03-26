@@ -15,6 +15,7 @@ class NeuroModConfig:
     num_heads: int = 4
     num_shared_blocks: int = 2
     max_iterations: int = 6
+    min_iterations_before_halt: int = 1
     ff_mult: float = 2.0
     seq_len: int = 64
 
@@ -119,13 +120,14 @@ CONTINUOUS_PARAMS = {
     "attractor_threshold": (0.001, 0.1),
     "depression_rate": (0.01, 0.2),
     "energy_budget": (0.5, 2.0),
-    "iteration_cost": (0.001, 0.1),
+    "iteration_cost": (0.0, 0.1),
 }
 
 CATEGORICAL_PARAMS = {
     "halt_combination": ["any", "majority", "learned"],
     "mod_dim": [8, 16, 32],
-    "max_iterations": [3, 4, 6, 8],
+    "max_iterations": [3, 4, 6, 8, 10, 12],
+    "min_iterations_before_halt": [1, 2, 3, 4, 6, 8],
     "num_shared_blocks": [1, 2, 3],
 }
 
@@ -138,23 +140,33 @@ SEARCH_SPACE_SPECS = {
     "motif_only": {
         "boolean": list(BOOLEAN_PARAMS),
         "continuous": ["iteration_cost"],
-        "categorical": ["halt_combination", "mod_dim", "max_iterations", "num_shared_blocks"],
+        "categorical": [
+            "halt_combination", "mod_dim", "max_iterations",
+            "min_iterations_before_halt", "num_shared_blocks",
+        ],
     },
     "modulation_only": {
         "boolean": list(MODULATION_BOOLEAN_PARAMS),
         "continuous": [],
-        "categorical": ["mod_dim", "max_iterations", "num_shared_blocks"],
+        "categorical": ["mod_dim", "max_iterations", "min_iterations_before_halt", "num_shared_blocks"],
     },
     "halting_only": {
         "boolean": list(HALTING_BOOLEAN_PARAMS),
         "continuous": ["attractor_threshold", "depression_rate", "energy_budget", "iteration_cost"],
-        "categorical": ["halt_combination", "max_iterations", "num_shared_blocks"],
+        "categorical": ["halt_combination", "max_iterations", "min_iterations_before_halt", "num_shared_blocks"],
     },
 }
 
 
 def _base_config(base: NeuroModConfig | None = None) -> NeuroModConfig:
     return copy.deepcopy(base) if base is not None else NeuroModConfig()
+
+
+def normalize_config(config: NeuroModConfig) -> NeuroModConfig:
+    config.max_iterations = max(1, int(config.max_iterations))
+    config.min_iterations_before_halt = max(1, int(config.min_iterations_before_halt))
+    config.min_iterations_before_halt = min(config.min_iterations_before_halt, config.max_iterations)
+    return config
 
 
 def get_search_space_spec(search_space: str = "all") -> dict[str, list[str]]:
@@ -184,7 +196,7 @@ def mutate(
         choices = CATEGORICAL_PARAMS[param]
         if random.random() < settings.categorical_prob:
             setattr(cfg, param, random.choice(choices))
-    return cfg
+    return normalize_config(cfg)
 
 
 def crossover(cfg1: NeuroModConfig, cfg2: NeuroModConfig) -> NeuroModConfig:
@@ -197,7 +209,7 @@ def crossover(cfg1: NeuroModConfig, cfg2: NeuroModConfig) -> NeuroModConfig:
             setattr(child, f.name, getattr(cfg1, f.name))
         else:
             setattr(child, f.name, getattr(cfg2, f.name))
-    return child
+    return normalize_config(child)
 
 
 def make_random_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
@@ -211,7 +223,7 @@ def make_random_config(base: NeuroModConfig | None = None, search_space: str = "
     for param in spec["categorical"]:
         choices = CATEGORICAL_PARAMS[param]
         setattr(cfg, param, random.choice(choices))
-    return cfg
+    return normalize_config(cfg)
 
 
 def make_all_on_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
@@ -219,7 +231,7 @@ def make_all_on_config(base: NeuroModConfig | None = None, search_space: str = "
     spec = get_search_space_spec(search_space)
     for param in spec["boolean"]:
         setattr(cfg, param, True)
-    return cfg
+    return normalize_config(cfg)
 
 
 def make_minimal_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
@@ -229,9 +241,11 @@ def make_minimal_config(base: NeuroModConfig | None = None, search_space: str = 
         setattr(cfg, param, False)
     if "max_iterations" in spec["categorical"]:
         cfg.max_iterations = 4
+    if "min_iterations_before_halt" in spec["categorical"]:
+        cfg.min_iterations_before_halt = 1
     if "num_shared_blocks" in spec["categorical"]:
         cfg.num_shared_blocks = 2
-    return cfg
+    return normalize_config(cfg)
 
 
 def make_modulation_only_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
@@ -240,7 +254,7 @@ def make_modulation_only_config(base: NeuroModConfig | None = None, search_space
     for param in MODULATION_BOOLEAN_PARAMS:
         if param in spec["boolean"]:
             setattr(cfg, param, True)
-    return cfg
+    return normalize_config(cfg)
 
 
 def make_halting_only_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
@@ -251,53 +265,74 @@ def make_halting_only_config(base: NeuroModConfig | None = None, search_space: s
             setattr(cfg, param, True)
     if "halt_combination" in spec["categorical"]:
         cfg.halt_combination = "learned"
-    return cfg
+    return normalize_config(cfg)
+
+
+def make_deep_recursion_config(base: NeuroModConfig | None = None, search_space: str = "all") -> NeuroModConfig:
+    cfg = make_all_on_config(base, search_space=search_space)
+    spec = get_search_space_spec(search_space)
+    if "max_iterations" in spec["categorical"]:
+        cfg.max_iterations = max(CATEGORICAL_PARAMS["max_iterations"])
+    if "min_iterations_before_halt" in spec["categorical"]:
+        cfg.min_iterations_before_halt = max(2, cfg.max_iterations // 2)
+    if "iteration_cost" in spec["continuous"]:
+        cfg.iteration_cost = CONTINUOUS_PARAMS["iteration_cost"][0]
+    if "use_energy_budget" in spec["boolean"]:
+        cfg.use_energy_budget = False
+    if "use_attractor_halt" in spec["boolean"]:
+        cfg.use_attractor_halt = False
+    if "halt_combination" in spec["categorical"]:
+        cfg.halt_combination = "learned"
+    return normalize_config(cfg)
 
 
 def make_preset_config(name: str) -> NeuroModConfig:
     cfg = NeuroModConfig()
     if name == "default":
-        return cfg
+        return normalize_config(cfg)
     if name == "fineweb_medium":
         cfg.hidden_dim = 384
         cfg.num_heads = 6
         cfg.ff_mult = 3.0
         cfg.mod_dim = 32
         cfg.num_shared_blocks = 2
-        cfg.max_iterations = 4
+        cfg.max_iterations = 6
+        cfg.min_iterations_before_halt = 2
         cfg.batch_size = 16
         cfg.lr = 2e-4
         cfg.warmup_steps = 400
         cfg.num_cycles = 3
         cfg.min_lr_ratio = 0.08
-        cfg.iteration_cost = 0.005
-        return cfg
+        cfg.iteration_cost = 0.003
+        return normalize_config(cfg)
     if name == "fineweb_large":
         cfg.hidden_dim = 512
         cfg.num_heads = 8
         cfg.ff_mult = 3.0
         cfg.mod_dim = 32
         cfg.num_shared_blocks = 2
-        cfg.max_iterations = 4
+        cfg.max_iterations = 6
+        cfg.min_iterations_before_halt = 2
         cfg.batch_size = 8
         cfg.lr = 1.5e-4
         cfg.warmup_steps = 500
         cfg.num_cycles = 3
         cfg.min_lr_ratio = 0.08
-        cfg.iteration_cost = 0.005
-        return cfg
+        cfg.iteration_cost = 0.0025
+        return normalize_config(cfg)
     if name == "fineweb_competitive":
         cfg.hidden_dim = 640
         cfg.num_heads = 10
         cfg.ff_mult = 3.0
         cfg.mod_dim = 32
         cfg.num_shared_blocks = 3
-        cfg.max_iterations = 4
+        cfg.max_iterations = 8
+        cfg.min_iterations_before_halt = 2
         cfg.batch_size = 6
         cfg.lr = 1.2e-4
         cfg.warmup_steps = 700
         cfg.num_cycles = 3
         cfg.min_lr_ratio = 0.08
-        cfg.iteration_cost = 0.003
-        return cfg
+        cfg.iteration_cost = 0.0015
+        return normalize_config(cfg)
     raise ValueError(f"unknown preset {name!r}")

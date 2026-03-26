@@ -228,6 +228,9 @@ class NeuroModRecursiveModel(nn.Module):
 
             # 4f. Combine halt signals
             should_halt, halt_prob = self.halt_combiner(halt_signals, batch_size=B, device=device)
+            if (i + 1) < cfg.min_iterations_before_halt:
+                halt_prob = torch.zeros_like(halt_prob)
+                should_halt = torch.zeros_like(should_halt)
 
             # 4g. ACT bookkeeping
             # Clamp so cumulative doesn't exceed 1
@@ -248,6 +251,7 @@ class NeuroModRecursiveModel(nn.Module):
                     "energy": energy.detach().clone() if cfg.use_energy_budget else None,
                     "delta_norm": relative_delta.detach(),
                     "hidden_norm": hidden_norm.detach(),
+                    "halt_enabled": torch.full((B, 1), float((i + 1) >= cfg.min_iterations_before_halt), device=device),
                     "modulation_stats": {k: v.detach() for k, v in modulation_stats.items()} if modulation_stats else None,
                 })
 

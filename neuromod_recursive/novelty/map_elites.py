@@ -29,7 +29,7 @@ MAP_ELITES_DIMENSIONS = {
     },
     "effective_depth": {
         "compute_from_config": lambda cfg: cfg.num_shared_blocks * cfg.max_iterations,
-        "bins": [0, 6, 12, 18, 24],
+        "bins": [0, 6, 12, 18, 24, 30, 36],
     },
     "iteration_variance": {
         "compute_from_profile": lambda profile: profile.iteration_variance,

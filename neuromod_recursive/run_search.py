@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from .config import MutationSettings, NeuroModConfig, SEARCH_SPACE_SPECS, make_preset_config
+from .config import MutationSettings, NeuroModConfig, SEARCH_SPACE_SPECS, make_preset_config, normalize_config
 from .model import NeuroModRecursiveModel, count_parameters
 from .search import run_evolutionary_search
 from .train import train_single_config, train_distributed
@@ -97,6 +97,7 @@ def parse_args():
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
     parser.add_argument("--num-shared-blocks", type=int, default=None, help="Override number of shared blocks")
     parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive iterations")
+    parser.add_argument("--min-iterations-before-halt", type=int, default=None, help="Minimum recursive iterations before halting can trigger")
     parser.add_argument("--batch-size", type=int, default=None, help="Override per-process batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override optimizer learning rate")
     parser.add_argument("--warmup-steps", type=int, default=None, help="Override LR warmup steps")
@@ -146,6 +147,7 @@ def build_base_config(args) -> NeuroModConfig:
         "mod_dim": args.mod_dim,
         "num_shared_blocks": args.num_shared_blocks,
         "max_iterations": args.max_iterations,
+        "min_iterations_before_halt": args.min_iterations_before_halt,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "warmup_steps": args.warmup_steps,
@@ -156,7 +158,7 @@ def build_base_config(args) -> NeuroModConfig:
     for name, value in overrides.items():
         if value is not None:
             setattr(config, name, value)
-    return config
+    return normalize_config(config)
 
 
 def main():
@@ -241,6 +243,7 @@ def main():
         f"Base config: preset={args.preset} hidden_dim={base_config.hidden_dim} "
         f"heads={base_config.num_heads} ff_mult={base_config.ff_mult} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
+        f"min_halt={base_config.min_iterations_before_halt} "
         f"batch_size={base_config.batch_size} lr={base_config.lr:g} "
         f"params={format_param_count(preview_params)}"
     )
@@ -364,7 +367,8 @@ def main():
               f"iters={profile.mean_iterations:.1f} | "
               f"mechanisms={active} | "
               f"blocks={cfg.num_shared_blocks} | "
-              f"max_iter={cfg.max_iterations}")
+              f"max_iter={cfg.max_iterations} | "
+              f"min_halt={cfg.min_iterations_before_halt}")
 
 
 if __name__ == "__main__":
