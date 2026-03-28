@@ -315,15 +315,39 @@ def _maybe_apply_swa(
     swa_state: dict[str, Tensor] | None,
     swa_count: int,
 ) -> bool:
-    if swa_state is None or swa_count <= 1:
-        return False
     current_state = export_state_dict(model)
-    avg_state = {
+    avg_state = _build_swa_state(current_state, swa_state, swa_count)
+    if avg_state is None:
+        return False
+    model.load_state_dict(avg_state, strict=True)
+    return True
+
+
+def _build_swa_state(
+    current_state: dict[str, Tensor],
+    swa_state: dict[str, Tensor] | None,
+    swa_count: int,
+) -> dict[str, Tensor] | None:
+    if swa_state is None or swa_count <= 1:
+        return None
+    return {
         name: (tensor / swa_count).to(dtype=current_state[name].dtype)
         for name, tensor in swa_state.items()
     }
-    model.load_state_dict(avg_state, strict=True)
-    return True
+
+
+def _score_from_eval_result(eval_result: dict) -> float:
+    val_bpb = eval_result.get("val_bpb")
+    if val_bpb is not None:
+        return float(val_bpb)
+    return float(eval_result["val_loss"])
+
+
+def _snapshot_state_dict(model: nn.Module) -> dict[str, Tensor]:
+    return {
+        name: tensor.detach().to(device="cpu").clone()
+        for name, tensor in export_state_dict(model).items()
+    }
 
 
 def evaluate_trained_model(
@@ -333,6 +357,7 @@ def evaluate_trained_model(
     fineweb_setup: Optional[dict] = None,
     eval_batches: int = 5,
     amp_dtype: str | None = "none",
+    progress_label: str | None = None,
 ) -> dict:
     """Evaluate a trained model on either FineWeb or synthetic validation."""
     if fineweb_setup is not None:
@@ -350,6 +375,7 @@ def evaluate_trained_model(
             device=device,
             amp_dtype=amp_dtype,
             stride=config.eval_stride,
+            progress_label=progress_label,
         )
         return {
             "val_loss": val_loss,
@@ -385,6 +411,8 @@ def train_single_config(
     eval_setup: Optional[dict] = None,
     amp_dtype: str | None = None,
     compile_model: bool = False,
+    best_checkpoint_every: int = 0,
+    best_checkpoint_val_sequences: int | None = None,
 ) -> dict:
     """Train a single config and return results.
 
@@ -408,6 +436,14 @@ def train_single_config(
         config.seq_len = eval_setup["seq_len"]
 
     final_eval_setup = eval_setup if eval_setup is not None else fineweb_setup
+    best_eval_setup = None
+    if final_eval_setup is not None and best_checkpoint_every > 0 and best_checkpoint_val_sequences:
+        from .fineweb_eval import make_eval_subset
+
+        best_eval_setup = make_eval_subset(
+            final_eval_setup,
+            max_sequences=best_checkpoint_val_sequences,
+        )
 
     base_model = NeuroModRecursiveModel(config).to(device)
     n_params = count_parameters(base_model)
@@ -430,6 +466,9 @@ def train_single_config(
     iteration_means = []
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    best_checkpoint_state: dict[str, Tensor] | None = None
+    best_checkpoint_score = float("inf")
+    best_checkpoint_step = -1
     start_time = time.time()
 
     for step in range(num_steps):
@@ -494,14 +533,73 @@ def train_single_config(
                 f"time={elapsed:.1f}s"
             )
 
+        if best_eval_setup is not None and (step + 1) % best_checkpoint_every == 0:
+            eval_result = evaluate_trained_model(
+                model,
+                config,
+                device=device,
+                fineweb_setup=best_eval_setup,
+                eval_batches=eval_batches,
+                amp_dtype=amp_dtype,
+            )
+            eval_score = _score_from_eval_result(eval_result)
+            if eval_score < best_checkpoint_score:
+                best_checkpoint_state = _snapshot_state_dict(model)
+                best_checkpoint_score = eval_score
+                best_checkpoint_step = step + 1
+            if not quiet:
+                score_label = "subset_val_bpb" if eval_result.get("val_bpb") is not None else "subset_val_loss"
+                best_label = "best_bpb" if eval_result.get("val_bpb") is not None else "best_loss"
+                print(
+                    f"    checkpoint eval @ step {step + 1}: "
+                    f"{score_label}={eval_score:.4f} | {best_label}={best_checkpoint_score:.4f}"
+                )
+            model.train()
+
     # --- Final evaluation ---
     elapsed = time.time() - start_time
     avg_iterations_run = (
         sum(iteration_means) / len(iteration_means) if iteration_means else float(config.max_iterations)
     )
-    applied_swa = _maybe_apply_swa(base_model, swa_state, swa_count)
-    if applied_swa and not quiet:
-        print(f"  Applied SWA over {swa_count} checkpoints")
+    current_state = _snapshot_state_dict(model)
+    candidate_states: list[tuple[str, dict[str, Tensor]]] = [("final", current_state)]
+    if best_checkpoint_state is not None:
+        candidate_states.append((f"best_step_{best_checkpoint_step}", best_checkpoint_state))
+    swa_avg_state = _build_swa_state(current_state, swa_state, swa_count)
+    if swa_avg_state is not None:
+        candidate_states.append((f"swa_{swa_count}", swa_avg_state))
+        if not quiet:
+            print(f"  Captured SWA over {swa_count} checkpoints")
+
+    chosen_label = "final"
+    if len(candidate_states) > 1 and best_eval_setup is not None:
+        best_candidate_score = float("inf")
+        for label, state in candidate_states:
+            base_model.load_state_dict(state, strict=True)
+            eval_result = evaluate_trained_model(
+                model,
+                config,
+                device=device,
+                fineweb_setup=best_eval_setup,
+                eval_batches=eval_batches,
+                amp_dtype=amp_dtype,
+            )
+            eval_score = _score_from_eval_result(eval_result)
+            if not quiet:
+                score_label = "subset_val_bpb" if eval_result.get("val_bpb") is not None else "subset_val_loss"
+                print(f"    final candidate {label}: {score_label}={eval_score:.4f}")
+            if eval_score < best_candidate_score:
+                best_candidate_score = eval_score
+                chosen_label = label
+        chosen_state = next(state for label, state in candidate_states if label == chosen_label)
+        base_model.load_state_dict(chosen_state, strict=True)
+        if not quiet:
+            print(f"  Restored checkpoint: {chosen_label}")
+    elif swa_avg_state is not None:
+        base_model.load_state_dict(swa_avg_state, strict=True)
+        chosen_label = f"swa_{swa_count}"
+        if not quiet:
+            print(f"  Restored checkpoint: {chosen_label}")
 
     eval_result = evaluate_trained_model(
         model,
@@ -510,6 +608,7 @@ def train_single_config(
         fineweb_setup=final_eval_setup,
         eval_batches=eval_batches,
         amp_dtype=amp_dtype,
+        progress_label=None if quiet else "final eval",
     )
     exported_model = unwrap_model(model)
 
@@ -523,10 +622,11 @@ def train_single_config(
             "n_params": n_params,
             "elapsed_seconds": elapsed,
             "model": exported_model,
+            "selected_checkpoint": chosen_label,
         }
         if not quiet:
             print(f"\n  Final: val_loss={result['val_loss']:.4f} | val_bpb={result['val_bpb']:.4f} | "
-                  f"avg_iters={avg_iterations_run:.1f} | time={elapsed:.1f}s")
+                  f"avg_iters={avg_iterations_run:.1f} | checkpoint={chosen_label} | time={elapsed:.1f}s")
     else:
         result = {
             "val_loss": eval_result["val_loss"],
@@ -537,10 +637,11 @@ def train_single_config(
             "n_params": n_params,
             "elapsed_seconds": elapsed,
             "model": exported_model,
+            "selected_checkpoint": chosen_label,
         }
         if not quiet:
             print(f"\n  Final: val_loss={result['val_loss']:.4f} | "
-                  f"avg_iters={result['avg_iterations']:.1f} | "
+                  f"avg_iters={result['avg_iterations']:.1f} | checkpoint={chosen_label} | "
                   f"time={elapsed:.1f}s")
 
     return result

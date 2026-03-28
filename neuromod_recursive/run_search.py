@@ -125,15 +125,23 @@ def parse_args():
     parser.add_argument("--disable-block-skips", action="store_true", help="Disable U-Net style skip connections across recursive blocks")
     parser.add_argument("--batch-size", type=int, default=None, help="Override per-process batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override optimizer learning rate")
+    parser.add_argument("--matrix-lr", type=float, default=None, help="Override Muon matrix learning rate")
+    parser.add_argument("--scalar-lr", type=float, default=None, help="Override scalar/vector Adam learning rate")
+    parser.add_argument("--embed-lr", type=float, default=None, help="Override untied embedding learning rate")
+    parser.add_argument("--tied-embed-lr", type=float, default=None, help="Override tied embedding learning rate")
+    parser.add_argument("--head-lr", type=float, default=None, help="Override output head learning rate")
     parser.add_argument("--warmup-steps", type=int, default=None, help="Override LR warmup steps")
     parser.add_argument("--num-cycles", type=int, default=None, help="Override LR restart cycle count")
     parser.add_argument("--min-lr-ratio", type=float, default=None, help="Override LR floor ratio")
     parser.add_argument("--iteration-cost", type=float, default=None, help="Override recursive ponder cost")
+    parser.add_argument("--grad-clip-norm", type=float, default=None, help="Clip gradient norm to stabilize longer runs (0 disables)")
     parser.add_argument("--eval-stride", type=int, default=None, help="Use sliding-window BPB evaluation with this stride (0 disables)")
     parser.add_argument("--enable-swa", action="store_true", help="Enable stochastic weight averaging before final evaluation")
     parser.add_argument("--disable-swa", action="store_true", help="Disable stochastic weight averaging before final evaluation")
     parser.add_argument("--swa-start-frac", type=float, default=None, help="Begin SWA once LR scale falls below this fraction")
     parser.add_argument("--swa-every", type=int, default=None, help="Capture an SWA checkpoint every N steps")
+    parser.add_argument("--best-checkpoint-every", type=int, default=None, help="Subset-eval cadence for restoring the best checkpoint in single runs (0 disables)")
+    parser.add_argument("--best-checkpoint-val-seqs", type=int, default=None, help="Validation sequences used for best-checkpoint selection in single runs")
     parser.add_argument(
         "--amp-dtype",
         type=str,
@@ -183,10 +191,16 @@ def build_base_config(args) -> NeuroModConfig:
         "min_iterations_before_halt": args.min_iterations_before_halt,
         "batch_size": args.batch_size,
         "lr": args.lr,
+        "matrix_lr": args.matrix_lr,
+        "scalar_lr": args.scalar_lr,
+        "embed_lr": args.embed_lr,
+        "tied_embed_lr": args.tied_embed_lr,
+        "head_lr": args.head_lr,
         "warmup_steps": args.warmup_steps,
         "num_cycles": args.num_cycles,
         "min_lr_ratio": args.min_lr_ratio,
         "iteration_cost": args.iteration_cost,
+        "grad_clip_norm": args.grad_clip_norm,
         "eval_stride": args.eval_stride,
         "swa_start_frac": args.swa_start_frac,
         "swa_every": args.swa_every,
@@ -268,6 +282,10 @@ def main():
             args.elite_rerank_top_k = min(3, args.population)
         if args.elite_rerank_steps is None:
             args.elite_rerank_steps = max(args.steps * 2, args.steps)
+        if args.single and args.best_checkpoint_every is None and args.steps >= 5000:
+            args.best_checkpoint_every = max(1000, args.steps // 20)
+        if args.single and args.best_checkpoint_every and args.best_checkpoint_val_seqs is None:
+            args.best_checkpoint_val_seqs = min(1024, total_val_seqs)
         if args.target_val_bpb is None and args.preset == "fineweb_baseline_parity":
             args.target_val_bpb = 1.22436570
         if args.target_val_bpb is not None and args.target_reward_weight == 0.0 and args.target_penalty_weight == 0.0:
@@ -334,6 +352,8 @@ def main():
                 fineweb_setup=fineweb_setup,
                 amp_dtype=args.amp_dtype,
                 compile_model=args.compile_model,
+                best_checkpoint_every=max(0, args.best_checkpoint_every or 0),
+                best_checkpoint_val_sequences=args.best_checkpoint_val_seqs,
             )
 
         print(f"\nFinal val_loss: {result['val_loss']:.4f}")

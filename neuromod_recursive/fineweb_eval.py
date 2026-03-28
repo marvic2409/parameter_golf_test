@@ -167,6 +167,7 @@ def eval_fineweb_bpb(
     device: torch.device = torch.device("cpu"),
     amp_dtype: str | None = "none",
     stride: int = 0,
+    progress_label: str | None = None,
 ) -> tuple[float, float]:
     """Evaluate a model on FineWeb validation tokens.
 
@@ -189,6 +190,7 @@ def eval_fineweb_bpb(
             batch_size=batch_size,
             device=device,
             amp_dtype=amp_dtype,
+            progress_label=progress_label,
         )
 
     was_training = model.training
@@ -233,6 +235,11 @@ def eval_fineweb_bpb(
         ).to(dtype=torch.int16)
         val_byte_count += token_bytes.to(torch.float64).sum().item()
 
+        if progress_label is not None:
+            batch_end_idx = min(batch_start + batch_size, total_seqs)
+            if batch_end_idx == total_seqs or ((batch_start // batch_size) + 1) % 20 == 0:
+                print(f"  {progress_label}: {batch_end_idx}/{total_seqs} sequences")
+
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = val_token_count / val_byte_count
@@ -255,6 +262,7 @@ def eval_fineweb_bpb_sliding(
     batch_size: int = 8,
     device: torch.device = torch.device("cpu"),
     amp_dtype: str | None = "none",
+    progress_label: str | None = None,
 ) -> tuple[float, float]:
     was_training = model.training
     model.eval()
@@ -306,6 +314,11 @@ def eval_fineweb_bpb_sliding(
                 has_leading_space_lut[targets] & ~is_boundary_token_lut[prev_ids]
             ).to(torch.float64)
             byte_count += token_bytes.sum()
+
+        if progress_label is not None:
+            batch_end_idx = min(batch_start + batch_size, len(window_starts))
+            if batch_end_idx == len(window_starts) or ((batch_start // batch_size) + 1) % 20 == 0:
+                print(f"  {progress_label}: {batch_end_idx}/{len(window_starts)} windows")
 
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)
