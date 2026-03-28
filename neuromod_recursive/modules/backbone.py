@@ -1,8 +1,6 @@
 """Shared recursive transformer backbone with modulation hooks."""
 
 from __future__ import annotations
-
-import math
 from typing import Optional
 
 import torch
@@ -12,16 +10,126 @@ from torch import Tensor
 
 
 class Embedding(nn.Module):
-    def __init__(self, vocab_size: int, hidden_dim: int, seq_len: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_dim: int,
+        seq_len: int,
+        use_pos_emb: bool = True,
+        init_std: float = 0.005,
+    ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, hidden_dim)
-        self.pos_emb = nn.Embedding(seq_len, hidden_dim)
+        self.pos_emb = nn.Embedding(seq_len, hidden_dim) if use_pos_emb else None
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=init_std)
         self.hidden_dim = hidden_dim
 
     def forward(self, input_ids: Tensor) -> Tensor:
-        B, T = input_ids.shape
-        positions = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        return self.token_emb(input_ids) + self.pos_emb(positions)
+        _, T = input_ids.shape
+        x = self.token_emb(input_ids)
+        if self.pos_emb is not None:
+            positions = torch.arange(T, device=input_ids.device).unsqueeze(0)
+            x = x + self.pos_emb(positions)
+        return x
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+
+
+class CastedLinear(nn.Linear):
+    def forward(self, x: Tensor) -> Tensor:
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), bias)
+
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self._cos_cached: Tensor | None = None
+        self._sin_cached: Tensor | None = None
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        if (
+            self._cos_cached is None
+            or self._sin_cached is None
+            or self._seq_len_cached != seq_len
+            or self._cos_cached.device != device
+        ):
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            self._cos_cached = freqs.cos()[None, None, :, :]
+            self._sin_cached = freqs.sin()[None, None, :, :]
+            self._seq_len_cached = seq_len
+        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+
+
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+class ReLUSquaredMLP(nn.Module):
+    def __init__(self, hidden_dim: int, ff_mult: float = 2.0):
+        super().__init__()
+        ff_dim = int(hidden_dim * ff_mult)
+        self.fc = CastedLinear(hidden_dim, ff_dim, bias=False)
+        self.proj = CastedLinear(ff_dim, hidden_dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
+
+
+class SmearGate(nn.Module):
+    """Blend each token embedding with the previous token's embedding."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(hidden_dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        gate = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1.0 - gate) * x + gate * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash consecutive token pairs into a learned embedding table."""
+
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, hidden_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, hidden_dim, bias=False) if bigram_dim != hidden_dim else None
+        if self.proj is not None:
+            self.proj._zero_init = True
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, token_ids: Tensor) -> Tensor:
+        token_int = token_ids.to(torch.int32)
+        mod = max(self.bigram_vocab_size - 1, 1)
+        out = torch.empty_like(token_int)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * token_int[..., 1:], 27191 * token_int[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        hidden = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            hidden = self.proj(hidden)
+        return hidden * self.scale.to(dtype=hidden.dtype)
 
 
 class SharedTransformerBlock(nn.Module):
@@ -37,28 +145,56 @@ class SharedTransformerBlock(nn.Module):
       - residual_scale: scalar multiplier on residual connections
     """
 
-    def __init__(self, hidden_dim: int, num_heads: int, ff_mult: float = 2.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        ff_mult: float = 2.0,
+        use_rotary_embeddings: bool = True,
+        qk_gain_init: float = 1.5,
+        use_residual_mix: bool = True,
+    ):
         super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = hidden_dim // num_heads
+        if use_rotary_embeddings and self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even when rotary embeddings are enabled")
 
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm1 = RMSNorm()
+        self.norm2 = RMSNorm()
 
-        # Attention projections
-        self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.q_proj = CastedLinear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = CastedLinear(hidden_dim, kv_dim, bias=False)
+        self.v_proj = CastedLinear(hidden_dim, kv_dim, bias=False)
+        self.out_proj = CastedLinear(hidden_dim, hidden_dim, bias=False)
+        self.out_proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(hidden_dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(hidden_dim, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim) if use_rotary_embeddings else None
 
-        # Feedforward
-        ff_dim = int(hidden_dim * ff_mult)
-        self.ff = nn.Sequential(
-            nn.Linear(hidden_dim, ff_dim, bias=False),
-            nn.GELU(),
-            nn.Linear(ff_dim, hidden_dim, bias=False),
+        self.ff = ReLUSquaredMLP(hidden_dim, ff_mult)
+        self.resid_mix = (
+            nn.Parameter(torch.stack((torch.ones(hidden_dim), torch.zeros(hidden_dim))).float())
+            if use_residual_mix
+            else None
         )
+        self._init_weights()
 
-    def forward(self, x: Tensor, modulation: Optional[dict] = None) -> Tensor:
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
+
+    def forward(self, x: Tensor, x0: Tensor | None = None, modulation: Optional[dict] = None) -> Tensor:
         if modulation is None:
             modulation = {}
 
@@ -78,6 +214,10 @@ class SharedTransformerBlock(nn.Module):
         else:
             residual_scale = residual_scale.to(device=x.device, dtype=x.dtype)
 
+        if self.resid_mix is not None and x0 is not None:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
         # --- Pre-attention modulation ---
         h = self.norm1(x)
         if "attn_scale" in modulation:
@@ -87,12 +227,24 @@ class SharedTransformerBlock(nn.Module):
 
         # --- Self-attention ---
         B, T, C = h.shape
-        qkv = self.qkv(h) * weight_scale
-        qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D)
-        q, k, v = qkv.unbind(0)
+        q = self.q_proj(h).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        if self.rotary is not None:
+            cos, sin = self.rotary(T, x.device, q.dtype)
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
         attn = attn.transpose(1, 2).contiguous().view(B, T, C)
         attn_out = self.out_proj(attn) * weight_scale
 
@@ -100,7 +252,7 @@ class SharedTransformerBlock(nn.Module):
         if "channel_gate" in modulation:
             attn_out = attn_out * modulation["channel_gate"]
 
-        x = x + attn_out * residual_scale
+        x = x + attn_out * residual_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :]
 
         # --- Pre-FFN modulation ---
         h = self.norm2(x)
@@ -115,15 +267,34 @@ class SharedTransformerBlock(nn.Module):
         if "channel_gate" in modulation:
             ff_out = ff_out * modulation["channel_gate"]
 
-        x = x + ff_out * residual_scale
+        x = x + ff_out * residual_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :]
         return x
 
 
 class OutputHead(nn.Module):
-    def __init__(self, hidden_dim: int, vocab_size: int):
+    def __init__(
+        self,
+        hidden_dim: int,
+        vocab_size: int,
+        tie_embeddings: bool = True,
+        logit_softcap: float = 30.0,
+    ):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.proj = nn.Linear(hidden_dim, vocab_size, bias=False)
+        self.norm = RMSNorm()
+        self.tie_embeddings = tie_embeddings
+        self.logit_softcap = logit_softcap
+        self.proj = None if tie_embeddings else CastedLinear(hidden_dim, vocab_size, bias=False)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.proj(self.norm(x))
+    def forward(self, x: Tensor, token_emb_weight: Optional[Tensor] = None) -> Tensor:
+        h = self.norm(x)
+        if self.tie_embeddings:
+            if token_emb_weight is None:
+                raise ValueError("token_emb_weight must be provided when embeddings are tied")
+            logits = F.linear(h, token_emb_weight)
+        else:
+            if self.proj is None:
+                raise RuntimeError("proj is required when embeddings are untied")
+            logits = self.proj(h)
+        if self.logit_softcap > 0.0:
+            logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return logits

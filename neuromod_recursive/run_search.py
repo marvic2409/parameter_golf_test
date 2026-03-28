@@ -50,6 +50,9 @@ def parse_args():
     parser.add_argument("--fitness-efficiency-weight", type=float, default=0.02, help="Penalty weight for average iterations in search fitness")
     parser.add_argument("--fitness-simplicity-weight", type=float, default=0.01, help="Penalty weight for active mechanisms in search fitness")
     parser.add_argument("--fitness-quant-penalty", type=float, default=1.0, help="Penalty weight for post-quant degradation in search fitness")
+    parser.add_argument("--target-val-bpb", type=float, default=None, help="Optional BPB target used to reward candidates below a baseline and punish candidates above it")
+    parser.add_argument("--target-reward-weight", type=float, default=0.0, help="Extra fitness weight for beating target-val-bpb")
+    parser.add_argument("--target-penalty-weight", type=float, default=0.0, help="Extra fitness weight for missing target-val-bpb")
     parser.add_argument("--mutation-boolean-prob", type=float, default=0.15, help="Base mutation probability for boolean genes")
     parser.add_argument("--mutation-continuous-prob", type=float, default=0.20, help="Base mutation probability for continuous genes")
     parser.add_argument("--mutation-continuous-scale", type=float, default=0.10, help="Gaussian mutation scale as a fraction of each continuous range")
@@ -71,7 +74,7 @@ def parse_args():
         "--preset",
         type=str,
         default="default",
-        choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive"],
+        choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_baseline_parity"],
         help="Base config preset before applying any explicit overrides.",
     )
 
@@ -93,17 +96,30 @@ def parse_args():
     # Base-config overrides.
     parser.add_argument("--hidden-dim", type=int, default=None, help="Override model hidden size")
     parser.add_argument("--num-heads", type=int, default=None, help="Override number of attention heads")
+    parser.add_argument("--num-kv-heads", type=int, default=None, help="Override number of KV heads for grouped attention")
     parser.add_argument("--ff-mult", type=float, default=None, help="Override FFN expansion multiplier")
+    parser.add_argument("--bigram-hash-buckets", type=int, default=None, help="Override hashed bigram vocabulary size (0 disables)")
+    parser.add_argument("--bigram-hash-dim", type=int, default=None, help="Override hashed bigram embedding dimension")
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
     parser.add_argument("--num-shared-blocks", type=int, default=None, help="Override number of shared blocks")
     parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive iterations")
     parser.add_argument("--min-iterations-before-halt", type=int, default=None, help="Minimum recursive iterations before halting can trigger")
+    parser.add_argument("--untie-block-weights", action="store_true", help="Use unique block weights at each recursion iteration instead of sharing them")
+    parser.add_argument("--enable-smear-gate", action="store_true", help="Enable pre-attention token smear gating")
+    parser.add_argument("--disable-smear-gate", action="store_true", help="Disable pre-attention token smear gating")
+    parser.add_argument("--disable-residual-mix", action="store_true", help="Disable trainable residual mixing with the input stream")
+    parser.add_argument("--disable-block-skips", action="store_true", help="Disable U-Net style skip connections across recursive blocks")
     parser.add_argument("--batch-size", type=int, default=None, help="Override per-process batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override optimizer learning rate")
     parser.add_argument("--warmup-steps", type=int, default=None, help="Override LR warmup steps")
     parser.add_argument("--num-cycles", type=int, default=None, help="Override LR restart cycle count")
     parser.add_argument("--min-lr-ratio", type=float, default=None, help="Override LR floor ratio")
     parser.add_argument("--iteration-cost", type=float, default=None, help="Override recursive ponder cost")
+    parser.add_argument("--eval-stride", type=int, default=None, help="Use sliding-window BPB evaluation with this stride (0 disables)")
+    parser.add_argument("--enable-swa", action="store_true", help="Enable stochastic weight averaging before final evaluation")
+    parser.add_argument("--disable-swa", action="store_true", help="Disable stochastic weight averaging before final evaluation")
+    parser.add_argument("--swa-start-frac", type=float, default=None, help="Begin SWA once LR scale falls below this fraction")
+    parser.add_argument("--swa-every", type=int, default=None, help="Capture an SWA checkpoint every N steps")
     parser.add_argument(
         "--amp-dtype",
         type=str,
@@ -143,7 +159,10 @@ def build_base_config(args) -> NeuroModConfig:
     overrides = {
         "hidden_dim": args.hidden_dim,
         "num_heads": args.num_heads,
+        "num_kv_heads": args.num_kv_heads,
         "ff_mult": args.ff_mult,
+        "bigram_hash_buckets": args.bigram_hash_buckets,
+        "bigram_hash_dim": args.bigram_hash_dim,
         "mod_dim": args.mod_dim,
         "num_shared_blocks": args.num_shared_blocks,
         "max_iterations": args.max_iterations,
@@ -154,10 +173,27 @@ def build_base_config(args) -> NeuroModConfig:
         "num_cycles": args.num_cycles,
         "min_lr_ratio": args.min_lr_ratio,
         "iteration_cost": args.iteration_cost,
+        "eval_stride": args.eval_stride,
+        "swa_start_frac": args.swa_start_frac,
+        "swa_every": args.swa_every,
     }
     for name, value in overrides.items():
         if value is not None:
             setattr(config, name, value)
+    if args.untie_block_weights:
+        config.share_block_weights = False
+    if args.enable_smear_gate:
+        config.use_smear_gate = True
+    if args.disable_smear_gate:
+        config.use_smear_gate = False
+    if args.disable_residual_mix:
+        config.use_residual_mix = False
+    if args.disable_block_skips:
+        config.use_block_skip_connections = False
+    if args.enable_swa:
+        config.swa_enabled = True
+    if args.disable_swa:
+        config.swa_enabled = False
     return normalize_config(config)
 
 
@@ -218,6 +254,11 @@ def main():
             args.elite_rerank_top_k = min(3, args.population)
         if args.elite_rerank_steps is None:
             args.elite_rerank_steps = max(args.steps * 2, args.steps)
+        if args.target_val_bpb is None and args.preset == "fineweb_baseline_parity":
+            args.target_val_bpb = 1.22436570
+        if args.target_val_bpb is not None and args.target_reward_weight == 0.0 and args.target_penalty_weight == 0.0:
+            args.target_reward_weight = 2.0
+            args.target_penalty_weight = 1.0
     else:
         if args.promote_top_k is None:
             args.promote_top_k = 0
@@ -241,9 +282,14 @@ def main():
 
     print(
         f"Base config: preset={args.preset} hidden_dim={base_config.hidden_dim} "
-        f"heads={base_config.num_heads} ff_mult={base_config.ff_mult} "
+        f"heads={base_config.num_heads}/{base_config.num_kv_heads} ff_mult={base_config.ff_mult} "
+        f"bigram={base_config.bigram_hash_buckets}x{base_config.bigram_hash_dim} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
         f"min_halt={base_config.min_iterations_before_halt} "
+        f"shared_weights={base_config.share_block_weights} "
+        f"smear={base_config.use_smear_gate} resid_mix={base_config.use_residual_mix} "
+        f"skips={base_config.use_block_skip_connections} eval_stride={base_config.eval_stride} "
+        f"swa={base_config.swa_enabled} "
         f"batch_size={base_config.batch_size} lr={base_config.lr:g} "
         f"params={format_param_count(preview_params)}"
     )
@@ -304,6 +350,11 @@ def main():
         f"transform={args.novelty_transform} eff={args.fitness_efficiency_weight:.2f} "
         f"simplicity={args.fitness_simplicity_weight:.2f} quant={args.fitness_quant_penalty:.2f}"
     )
+    if args.target_val_bpb is not None:
+        print(
+            f"Target shaping: val_bpb<={args.target_val_bpb:.6f} "
+            f"reward={args.target_reward_weight:.2f} penalty={args.target_penalty_weight:.2f}"
+        )
     if fineweb_setup:
         print(
             f"Staged eval: screen={args.screen_val_seqs} seqs | "
@@ -349,6 +400,9 @@ def main():
         fitness_quant_penalty=args.fitness_quant_penalty,
         random_immigrants=args.random_immigrants,
         archive_samples=args.archive_samples,
+        target_score=args.target_val_bpb,
+        target_reward_weight=args.target_reward_weight,
+        target_penalty_weight=args.target_penalty_weight,
     )
     total_time = time.time() - t0
 

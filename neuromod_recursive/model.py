@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 from .config import NeuroModConfig
-from .modules.backbone import Embedding, OutputHead, SharedTransformerBlock
+from .modules.backbone import (
+    BigramHashEmbedding,
+    Embedding,
+    OutputHead,
+    SharedTransformerBlock,
+    SmearGate,
+)
 from .modules.halting import (
     AttractorHalt, EnergyBudgetHalt, HaltCombiner, InhibitoryDamping,
     LearnedHalt, ModulatorHalt, SynapticDepression,
@@ -59,18 +67,62 @@ class NeuroModRecursiveModel(nn.Module):
     def __init__(self, config: NeuroModConfig):
         super().__init__()
         self.config = config
+        self.modulation_enabled = any([
+            config.use_global_modulation,
+            config.use_layer_modulation,
+            config.use_channel_gating,
+            config.use_modulator_halt,
+        ])
+        block_param_count = (
+            config.num_shared_blocks
+            if config.share_block_weights
+            else config.num_shared_blocks * config.max_iterations
+        )
 
         # --- Embedding (applied once) ---
-        self.embedding = Embedding(config.vocab_size, config.hidden_dim, config.seq_len)
+        self.embedding = Embedding(
+            config.vocab_size,
+            config.hidden_dim,
+            config.seq_len,
+            use_pos_emb=not config.use_rotary_embeddings,
+            init_std=config.tied_embed_init_std,
+        )
+        self.bigram = (
+            BigramHashEmbedding(config.bigram_hash_buckets, config.bigram_hash_dim, config.hidden_dim)
+            if config.bigram_hash_buckets > 0
+            else None
+        )
+        self.smear_gate = SmearGate(config.hidden_dim) if config.use_smear_gate else None
+
+        self.num_encoder_blocks = config.num_shared_blocks // 2
+        self.num_decoder_blocks = config.num_shared_blocks - self.num_encoder_blocks
+        self.num_skip_weights = (
+            min(self.num_encoder_blocks, self.num_decoder_blocks)
+            if config.use_block_skip_connections
+            else 0
+        )
+        self.skip_weights = (
+            nn.Parameter(torch.ones(self.num_skip_weights, config.hidden_dim, dtype=torch.float32))
+            if self.num_skip_weights > 0
+            else None
+        )
 
         # --- Shared transformer blocks ---
         self.shared_blocks = nn.ModuleList([
-            SharedTransformerBlock(config.hidden_dim, config.num_heads, config.ff_mult)
-            for _ in range(config.num_shared_blocks)
+            SharedTransformerBlock(
+                config.hidden_dim,
+                config.num_heads,
+                config.num_kv_heads,
+                config.ff_mult,
+                use_rotary_embeddings=config.use_rotary_embeddings,
+                qk_gain_init=config.qk_gain_init,
+                use_residual_mix=config.use_residual_mix,
+            )
+            for _ in range(block_param_count)
         ])
 
         # --- Modulator ---
-        self.modulator = ModulatorNetwork(config)
+        self.modulator = ModulatorNetwork(config) if self.modulation_enabled else None
 
         # --- Halting mechanisms ---
         if config.use_attractor_halt:
@@ -92,10 +144,31 @@ class NeuroModRecursiveModel(nn.Module):
         self.halt_combiner = HaltCombiner(config)
 
         # --- Inter-iteration normalization (prevents activation explosion in recursive loop) ---
-        self.iter_norm = nn.LayerNorm(config.hidden_dim)
+        self.iter_norm = nn.Identity()
 
         # --- Output head ---
-        self.output_head = OutputHead(config.hidden_dim, config.vocab_size)
+        self.output_head = OutputHead(
+            config.hidden_dim,
+            config.vocab_size,
+            tie_embeddings=config.tie_embeddings,
+            logit_softcap=config.logit_softcap,
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        total_layers = max(len(self.shared_blocks), 1)
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if getattr(module, "_zero_init", False):
+                    nn.init.zeros_(module.weight)
+                    continue
+                if module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
+                    nn.init.orthogonal_(module.weight, gain=1.0)
+                    if name.endswith("out_proj") or name.endswith("ff.proj"):
+                        with torch.no_grad():
+                            module.weight.mul_(1.0 / math.sqrt(2 * total_layers))
+            elif isinstance(module, nn.Embedding) and name.endswith("pos_emb"):
+                nn.init.normal_(module.weight, mean=0.0, std=0.01)
 
     def forward(
         self,
@@ -117,6 +190,12 @@ class NeuroModRecursiveModel(nn.Module):
 
         # 1. Embed
         h = self.embedding(input_ids)  # (B, T, D)
+        if self.bigram is not None:
+            h = h + self.bigram(input_ids)
+        h = F.rms_norm(h, (h.size(-1),))
+        if self.smear_gate is not None:
+            h = self.smear_gate(h)
+        x0 = h
 
         # 2. Initial modulator context
         input_summary = h.mean(dim=1)  # (B, D)
@@ -140,7 +219,7 @@ class NeuroModRecursiveModel(nn.Module):
         if cfg.use_oscillatory_gating:
             oscillation_schedule = self.oscillatory_gating.all_gates(cfg.max_iterations, dtype=h.dtype)
         iteration_schedule = None
-        if cfg.use_iteration_encoding:
+        if self.modulator is not None and cfg.use_iteration_encoding:
             iteration_schedule = self.modulator.iteration_features(
                 cfg.max_iterations,
                 device=device,
@@ -155,11 +234,14 @@ class NeuroModRecursiveModel(nn.Module):
             # 4b. Generate modulation
             hidden_summary = h.mean(dim=1) if cfg.use_adaptive_modulation else None
             iter_features = iteration_schedule[i] if iteration_schedule is not None else None
-            modulation = self.modulator(
-                input_summary,
-                hidden_summary=hidden_summary,
-                iteration_features=iter_features,
-            )
+            if self.modulator is not None:
+                modulation = self.modulator(
+                    input_summary,
+                    hidden_summary=hidden_summary,
+                    iteration_features=iter_features,
+                )
+            else:
+                modulation = {}
 
             # Clamp modulation outputs to safe ranges
             if "global_scale" in modulation:
@@ -183,8 +265,17 @@ class NeuroModRecursiveModel(nn.Module):
             modulation_stats = _summarize_modulation(modulation, B, device) if return_details else None
 
             # 4d. Run shared blocks with modulation
-            for block_idx, block in enumerate(self.shared_blocks):
+            skips: list[Tensor] = []
+            for block_idx in range(cfg.num_shared_blocks):
+                param_block_idx = block_idx if cfg.share_block_weights else (i * cfg.num_shared_blocks + block_idx)
+                block = self.shared_blocks[param_block_idx]
                 block_mod = extract_block_modulation(modulation, block_idx, cfg)
+
+                if self.num_skip_weights > 0 and block_idx >= self.num_encoder_blocks:
+                    decoder_idx = block_idx - self.num_encoder_blocks
+                    if decoder_idx < self.num_skip_weights and skips:
+                        skip_weight = self.skip_weights[decoder_idx].to(dtype=h.dtype)[None, None, :]
+                        h = h + skip_weight * skips.pop()
 
                 # Oscillatory gating
                 if cfg.use_oscillatory_gating:
@@ -202,7 +293,9 @@ class NeuroModRecursiveModel(nn.Module):
                 if "weight_scale" in modulation:
                     block_mod["weight_scale"] = modulation["weight_scale"]
 
-                h = block(h, modulation=block_mod)
+                h = block(h, x0=x0, modulation=block_mod)
+                if block_idx < self.num_encoder_blocks and len(skips) < self.num_skip_weights:
+                    skips.append(h)
 
             # 4d. Inhibitory damping
             if cfg.use_inhibitory_damping:
@@ -285,7 +378,10 @@ class NeuroModRecursiveModel(nn.Module):
             expected_iterations = torch.ones(B, device=device, dtype=h.dtype)
 
         # 6. Output head
-        logits = self.output_head(output_h)
+        logits = self.output_head(
+            output_h,
+            token_emb_weight=self.embedding.token_emb.weight if cfg.tie_embeddings else None,
+        )
 
         details = {
             "expected_iterations": expected_iterations,
@@ -300,6 +396,9 @@ class NeuroModRecursiveModel(nn.Module):
             details["final_hidden_summary"] = output_h.mean(dim=1).detach()
 
         return logits, details
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        return self(input_ids, return_details=False)[0]
 
 
 def compute_loss(

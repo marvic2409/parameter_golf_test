@@ -50,6 +50,9 @@ def compute_composite_fitness(
     w_simplicity: float = 0.05,
     w_size_penalty: float = 2.0,
     w_quant_penalty: float = 1.0,
+    target_score: float | None = None,
+    w_target_reward: float = 0.0,
+    w_target_penalty: float = 0.0,
 ) -> float:
     quality = -score_value
     efficiency = -avg_iterations
@@ -68,6 +71,10 @@ def compute_composite_fitness(
 
     # Quantization degradation penalty: penalize architectures that break after int8
     quant_penalty = -w_quant_penalty * quant_degradation
+    target_term = 0.0
+    if target_score is not None:
+        margin = target_score - score_value
+        target_term = (w_target_reward if margin >= 0.0 else w_target_penalty) * margin
 
     return (
         w_quality * quality
@@ -77,6 +84,7 @@ def compute_composite_fitness(
         + stability_bonus
         + size_penalty
         + quant_penalty
+        + target_term
     )
 
 
@@ -156,6 +164,7 @@ def _seed_population(
     search_space: str,
 ) -> list[NeuroModConfig]:
     population = [
+        copy.deepcopy(base_config),
         make_all_on_config(base_config, search_space=search_space),
         make_minimal_config(base_config, search_space=search_space),
     ]
@@ -370,6 +379,9 @@ def run_evolutionary_search(
     fitness_quant_penalty: float = 1.0,
     random_immigrants: int = 0,
     archive_samples: Optional[int] = None,
+    target_score: float | None = None,
+    target_reward_weight: float = 0.0,
+    target_penalty_weight: float = 0.0,
 ) -> MAPElitesArchive:
     """Run the full evolutionary search with MAP-Elites + speciation + novelty."""
     set_seed(seed)
@@ -514,6 +526,9 @@ def run_evolutionary_search(
                 w_efficiency=fitness_efficiency_weight,
                 w_simplicity=fitness_simplicity_weight,
                 w_quant_penalty=fitness_quant_penalty,
+                target_score=target_score,
+                w_target_reward=target_reward_weight,
+                w_target_penalty=target_penalty_weight,
             )
 
             results.append({
@@ -600,6 +615,9 @@ def run_evolutionary_search(
                 w_efficiency=fitness_efficiency_weight,
                 w_simplicity=fitness_simplicity_weight,
                 w_quant_penalty=fitness_quant_penalty,
+                target_score=target_score,
+                w_target_reward=target_reward_weight,
+                w_target_penalty=target_penalty_weight,
             )
             entry["promoted"] = True
             score_key = _config_key(config)
@@ -672,6 +690,9 @@ def run_evolutionary_search(
             "quality_promote_top_k": quality_promote_top_k,
             "random_immigrants": active_random_immigrants,
             "archive_samples": active_archive_samples,
+            "target_score": target_score,
+            "target_reward_weight": target_reward_weight,
+            "target_penalty_weight": target_penalty_weight,
         }
         generation_logs.append(gen_log)
         coverage_history.append(archive_stats["coverage"])

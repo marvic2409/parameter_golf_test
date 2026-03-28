@@ -14,12 +14,17 @@ import json
 import math
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
-import sentencepiece as spm
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+try:
+    import sentencepiece as spm
+except ModuleNotFoundError:
+    spm = None
 
 from .utils import autocast_context
 
@@ -55,7 +60,7 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 
 
 def build_sentencepiece_luts(
-    sp: spm.SentencePieceProcessor,
+    sp: Any,
     vocab_size: int,
     device: torch.device,
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -82,6 +87,16 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+
+def _extract_logits(model: torch.nn.Module, x: Tensor) -> Tensor:
+    if hasattr(model, "forward_logits"):
+        logits = model.forward_logits(x)
+    else:
+        logits = model(x)
+    if isinstance(logits, tuple):
+        return logits[0]
+    return logits
 
 
 # --- Token stream for training on real data ---
@@ -151,6 +166,7 @@ def eval_fineweb_bpb(
     batch_size: int = 8,
     device: torch.device = torch.device("cpu"),
     amp_dtype: str | None = "none",
+    stride: int = 0,
 ) -> tuple[float, float]:
     """Evaluate a model on FineWeb validation tokens.
 
@@ -160,6 +176,22 @@ def eval_fineweb_bpb(
     Returns:
         (val_loss, val_bpb) — matching the official challenge metrics.
     """
+    if 0 < stride < seq_len:
+        return eval_fineweb_bpb_sliding(
+            model=model,
+            val_tokens=val_tokens,
+            seq_len=seq_len,
+            vocab_size=vocab_size,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+            stride=stride,
+            batch_size=batch_size,
+            device=device,
+            amp_dtype=amp_dtype,
+        )
+
+    was_training = model.training
     model.eval()
     total_seqs = (val_tokens.numel() - 1) // seq_len
     val_loss_sum = 0.0
@@ -179,11 +211,7 @@ def eval_fineweb_bpb(
 
         # Forward pass — handle both our model (returns logits, details) and standard models
         with autocast_context(device, amp_dtype):
-            output = model(x)
-        if isinstance(output, tuple):
-            logits = output[0]
-        else:
-            logits = output
+            logits = _extract_logits(model, x)
 
         # Cross-entropy loss (sum, not mean, for proper averaging later)
         loss = F.cross_entropy(
@@ -210,8 +238,80 @@ def eval_fineweb_bpb(
     tokens_per_byte = val_token_count / val_byte_count
     val_bpb = bits_per_token * tokens_per_byte
 
-    model.train()
+    model.train(was_training)
     return float(val_loss), float(val_bpb)
+
+
+@torch.no_grad()
+def eval_fineweb_bpb_sliding(
+    model: torch.nn.Module,
+    val_tokens: Tensor,
+    seq_len: int,
+    vocab_size: int,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    batch_size: int = 8,
+    device: torch.device = torch.device("cpu"),
+    amp_dtype: str | None = "none",
+) -> tuple[float, float]:
+    was_training = model.training
+    model.eval()
+
+    total_tokens = val_tokens.numel() - 1
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= 1
+    ]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    for batch_start in range(0, len(window_starts), batch_size):
+        batch_windows = window_starts[batch_start : batch_start + batch_size]
+        actual_batch = len(batch_windows)
+        x_batch = torch.zeros(actual_batch, seq_len, dtype=torch.long, device=device)
+        y_batch = torch.zeros(actual_batch, seq_len, dtype=torch.long, device=device)
+        window_lengths: list[int] = []
+
+        for row, window_start in enumerate(batch_windows):
+            end = min(window_start + seq_len, total_tokens)
+            window_len = end - window_start
+            window_lengths.append(window_len)
+            chunk = val_tokens[window_start : end + 1].to(device=device, dtype=torch.long)
+            x_batch[row, :window_len] = chunk[:-1]
+            y_batch[row, :window_len] = chunk[1:]
+
+        with autocast_context(device, amp_dtype):
+            logits = _extract_logits(model, x_batch)
+        token_nll = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            y_batch.reshape(-1),
+            reduction="none",
+        ).reshape(actual_batch, seq_len)
+
+        for row, window_start in enumerate(batch_windows):
+            window_len = window_lengths[row]
+            score_start = 0 if window_start == 0 else max(window_len - stride, 0)
+            scored_nll = token_nll[row, score_start:window_len].to(torch.float64)
+            loss_sum += scored_nll.sum()
+            token_count += float(window_len - score_start)
+
+            targets = y_batch[row, score_start:window_len]
+            prev_ids = x_batch[row, score_start:window_len]
+            token_bytes = base_bytes_lut[targets].to(torch.float64)
+            token_bytes += (
+                has_leading_space_lut[targets] & ~is_boundary_token_lut[prev_ids]
+            ).to(torch.float64)
+            byte_count += token_bytes.sum()
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    model.train(was_training)
+    return val_loss, bits_per_token * tokens_per_byte
 
 
 def make_eval_subset(
@@ -330,3 +430,7 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
             )
 
     return dataset_dir.name, actual_train_files, expected_train_files
+    if spm is None:
+        raise ModuleNotFoundError(
+            "sentencepiece is required for setup_fineweb_eval(); install it to use FineWeb scoring"
+        )

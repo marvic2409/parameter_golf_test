@@ -34,7 +34,7 @@ from .utils import format_param_count, get_device
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark one recursive-search candidate and extrapolate")
-    parser.add_argument("--preset", choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive"], default="fineweb_medium")
+    parser.add_argument("--preset", choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_baseline_parity"], default="fineweb_medium")
     parser.add_argument("--use-fineweb", action="store_true", help="Benchmark with real FineWeb data")
     parser.add_argument("--data-path", type=str, default="./data/datasets/fineweb10B_sp1024")
     parser.add_argument("--tokenizer-path", type=str, default="./data/tokenizers/fineweb_1024_bpe.model")
@@ -86,8 +86,21 @@ def eval_workload_size(
     synthetic_eval_batches: int,
 ) -> tuple[int, int]:
     if fineweb_setup is not None:
-        token_count = int(fineweb_setup["val_tokens"].numel() - 1)
-        seq_count = token_count // config.seq_len
+        total_tokens = int(fineweb_setup["val_tokens"].numel() - 1)
+        if 0 < config.eval_stride < config.seq_len:
+            window_starts = [
+                window_start
+                for window_start in range(0, total_tokens, config.eval_stride)
+                if min(window_start + config.seq_len, total_tokens) - window_start >= 1
+            ]
+            token_count = sum(
+                min(config.seq_len, total_tokens - window_start)
+                for window_start in window_starts
+            )
+            seq_count = len(window_starts)
+        else:
+            token_count = total_tokens
+            seq_count = token_count // config.seq_len
         return token_count, seq_count
     seq_count = synthetic_eval_batches * config.batch_size
     token_count = seq_count * config.seq_len
@@ -383,6 +396,7 @@ def main() -> None:
         "device": str(device),
         "use_fineweb": args.use_fineweb,
         "amp_dtype": args.amp_dtype,
+        "eval_stride": config.eval_stride,
         "compile_model": args.compile_model,
         "compile_search_candidates": compile_search_candidates,
         "compile_elite_rerank": compile_elite_rerank,

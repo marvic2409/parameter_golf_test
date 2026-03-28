@@ -28,7 +28,7 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 CONTROL_PATTERNS = (
     "inhibition_gain", "amplitude", "frequency", "phase",  # our custom control params
     "attn_scale", "attn_scales", "mlp_scale", "mlp_scales",
-    "resid_mix", "skip_weight", "skip_weights",
+    "resid_mix", "skip_weight", "skip_weights", "bigram.scale",
 )
 
 
