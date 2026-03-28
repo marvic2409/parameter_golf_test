@@ -21,10 +21,18 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 import torch
 
-from .config import MutationSettings, NeuroModConfig, SEARCH_SPACE_SPECS, make_preset_config, normalize_config
+from .config import (
+    MutationSettings,
+    NeuroModConfig,
+    SEARCH_SPACE_SPECS,
+    load_config_json,
+    make_preset_config,
+    normalize_config,
+)
 from .model import NeuroModRecursiveModel, count_parameters
 from .search import run_evolutionary_search
 from .train import train_single_config, train_distributed
@@ -76,6 +84,12 @@ def parse_args():
         default="default",
         choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_baseline_parity"],
         help="Base config preset before applying any explicit overrides.",
+    )
+    parser.add_argument(
+        "--config-json",
+        type=str,
+        default=None,
+        help="Load the base config from a JSON file instead of a preset, then apply any CLI overrides.",
     )
 
     # Mode
@@ -155,7 +169,7 @@ def parse_args():
 
 
 def build_base_config(args) -> NeuroModConfig:
-    config = make_preset_config(args.preset)
+    config = load_config_json(args.config_json) if args.config_json else make_preset_config(args.preset)
     overrides = {
         "hidden_dim": args.hidden_dim,
         "num_heads": args.num_heads,
@@ -281,7 +295,8 @@ def main():
     del preview_model
 
     print(
-        f"Base config: preset={args.preset} hidden_dim={base_config.hidden_dim} "
+        f"Base config: source={Path(args.config_json).name if args.config_json else args.preset} "
+        f"hidden_dim={base_config.hidden_dim} "
         f"heads={base_config.num_heads}/{base_config.num_kv_heads} ff_mult={base_config.ff_mult} "
         f"bigram={base_config.bigram_hash_buckets}x{base_config.bigram_hash_dim} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "

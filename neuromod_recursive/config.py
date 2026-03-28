@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import random
 from dataclasses import dataclass, fields
+from pathlib import Path
 
 
 @dataclass
@@ -215,6 +217,21 @@ def normalize_config(config: NeuroModConfig) -> NeuroModConfig:
     config.eval_stride = max(0, int(config.eval_stride))
     config.swa_every = max(1, int(config.swa_every))
     return config
+
+
+def config_from_mapping(mapping: dict) -> NeuroModConfig:
+    """Build a config from a partial/complete dict, ignoring unknown keys."""
+    valid_fields = {f.name for f in fields(NeuroModConfig)}
+    filtered = {key: value for key, value in mapping.items() if key in valid_fields}
+    return normalize_config(NeuroModConfig(**filtered))
+
+
+def load_config_json(path: str | Path) -> NeuroModConfig:
+    """Load a config from a JSON file."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Config JSON must contain an object at top level: {path}")
+    return config_from_mapping(data)
 
 
 def get_search_space_spec(search_space: str = "all") -> dict[str, list[str]]:
