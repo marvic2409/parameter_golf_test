@@ -19,7 +19,7 @@ class ModulatorNetwork(nn.Module):
         self.config = config
         mod_dim = config.mod_dim
         hidden_dim = config.hidden_dim
-        num_blocks = config.num_shared_blocks
+        num_blocks = config.num_shared_blocks + (config.num_slow_blocks if config.use_fast_slow_hierarchy else 0)
 
         # Input projection: pool hidden_dim -> mod_dim
         self.input_proj = nn.Linear(hidden_dim, mod_dim)
@@ -84,7 +84,7 @@ class ModulatorNetwork(nn.Module):
                 # Initialize scales to 1, shifts to 0
                 bias = self.layer_head.bias.data
                 hidden_dim = cfg.hidden_dim
-                num_blocks = cfg.num_shared_blocks
+                num_blocks = cfg.num_shared_blocks + (cfg.num_slow_blocks if cfg.use_fast_slow_hierarchy else 0)
                 for b in range(num_blocks):
                     offset = b * hidden_dim * 2
                     bias[offset:offset + hidden_dim] = 1.0       # scale
@@ -152,7 +152,8 @@ class ModulatorNetwork(nn.Module):
 
         if cfg.use_layer_modulation:
             raw = self.layer_head(features)  # (B, num_blocks * hidden_dim * 2)
-            raw = raw.view(B, cfg.num_shared_blocks, cfg.hidden_dim * 2)
+            num_blocks = cfg.num_shared_blocks + (cfg.num_slow_blocks if cfg.use_fast_slow_hierarchy else 0)
+            raw = raw.view(B, num_blocks, cfg.hidden_dim * 2)
             layer_scale = raw[:, :, :cfg.hidden_dim]   # (B, num_blocks, hidden_dim)
             layer_shift = raw[:, :, cfg.hidden_dim:]   # (B, num_blocks, hidden_dim)
             outputs["layer_scale"] = layer_scale
@@ -160,7 +161,8 @@ class ModulatorNetwork(nn.Module):
 
         if cfg.use_channel_gating:
             raw = self.gate_head(features)  # (B, num_blocks * hidden_dim)
-            raw = raw.view(B, cfg.num_shared_blocks, cfg.hidden_dim)
+            num_blocks = cfg.num_shared_blocks + (cfg.num_slow_blocks if cfg.use_fast_slow_hierarchy else 0)
+            raw = raw.view(B, num_blocks, cfg.hidden_dim)
             outputs["channel_gate"] = torch.sigmoid(raw)  # (B, num_blocks, hidden_dim)
 
         if cfg.use_modulator_halt:
@@ -173,6 +175,7 @@ def extract_block_modulation(
     modulation: dict[str, Tensor],
     block_idx: int,
     config: NeuroModConfig,
+    block_offset: int = 0,
 ) -> dict[str, Tensor]:
     """Extract per-block modulation from the full modulation dict."""
     block_mod: dict[str, Tensor] = {}
@@ -184,8 +187,9 @@ def extract_block_modulation(
         block_mod["ffn_shift"] = modulation["global_shift"]
 
     if config.use_layer_modulation and "layer_scale" in modulation:
-        ls = modulation["layer_scale"][:, block_idx, :].unsqueeze(1)  # (B, 1, D)
-        lsh = modulation["layer_shift"][:, block_idx, :].unsqueeze(1)
+        mod_idx = block_offset + block_idx
+        ls = modulation["layer_scale"][:, mod_idx, :].unsqueeze(1)  # (B, 1, D)
+        lsh = modulation["layer_shift"][:, mod_idx, :].unsqueeze(1)
         # Combine with global if present
         if "attn_scale" in block_mod:
             block_mod["attn_scale"] = block_mod["attn_scale"] * ls
@@ -199,7 +203,8 @@ def extract_block_modulation(
             block_mod["ffn_shift"] = lsh
 
     if config.use_channel_gating and "channel_gate" in modulation:
-        cg = modulation["channel_gate"][:, block_idx, :].unsqueeze(1)  # (B, 1, D)
+        mod_idx = block_offset + block_idx
+        cg = modulation["channel_gate"][:, mod_idx, :].unsqueeze(1)  # (B, 1, D)
         block_mod["channel_gate"] = cg
 
     return block_mod

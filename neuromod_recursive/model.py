@@ -101,8 +101,11 @@ class NeuroModRecursiveModel(nn.Module):
             else None
         )
         self.slow_blocks = None
+        self.fast_to_slow = None
+        self.fast_gate = None
         self.slow_to_fast = None
         self.slow_gate = None
+        self.fast_residual_scale = None
         self.slow_residual_scale = None
 
         self.num_encoder_blocks = config.num_shared_blocks // 2
@@ -149,9 +152,13 @@ class NeuroModRecursiveModel(nn.Module):
                 )
                 for _ in range(slow_block_param_count)
             ])
+            self.fast_to_slow = CastedLinear(config.hidden_dim, config.hidden_dim, bias=False)
+            self.fast_to_slow._zero_init = True
+            self.fast_gate = nn.Linear(config.hidden_dim, config.hidden_dim)
             self.slow_to_fast = CastedLinear(config.hidden_dim, config.hidden_dim, bias=False)
             self.slow_to_fast._zero_init = True
             self.slow_gate = nn.Linear(config.hidden_dim, config.hidden_dim)
+            self.fast_residual_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
             self.slow_residual_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
         # --- Modulator ---
@@ -187,6 +194,9 @@ class NeuroModRecursiveModel(nn.Module):
             logit_softcap=config.logit_softcap,
         )
         self._init_weights()
+        if self.fast_gate is not None:
+            nn.init.zeros_(self.fast_gate.weight)
+            nn.init.constant_(self.fast_gate.bias, -2.0)
         if self.slow_gate is not None:
             nn.init.zeros_(self.slow_gate.weight)
             nn.init.constant_(self.slow_gate.bias, -2.0)
@@ -205,6 +215,85 @@ class NeuroModRecursiveModel(nn.Module):
                             module.weight.mul_(1.0 / math.sqrt(2 * total_layers))
             elif isinstance(module, nn.Embedding) and name.endswith("pos_emb"):
                 nn.init.normal_(module.weight, mean=0.0, std=0.01)
+
+    def _block_param_index(self, cycle_idx: int, block_idx: int, blocks_per_cycle: int) -> int:
+        if self.config.share_block_weights:
+            return block_idx
+        return cycle_idx * blocks_per_cycle + block_idx
+
+    def _clamp_modulation(self, modulation: dict[str, Tensor]) -> dict[str, Tensor]:
+        if "global_scale" in modulation:
+            modulation["global_scale"] = modulation["global_scale"].clamp(-2.0, 2.0)
+        if "global_shift" in modulation:
+            modulation["global_shift"] = modulation["global_shift"].clamp(-1.0, 1.0)
+        if "layer_scale" in modulation:
+            modulation["layer_scale"] = modulation["layer_scale"].clamp(0.1, 3.0)
+        if "layer_shift" in modulation:
+            modulation["layer_shift"] = modulation["layer_shift"].clamp(-1.0, 1.0)
+        return modulation
+
+    def _apply_weight_scale(
+        self,
+        modulation: dict[str, Tensor],
+        depression_schedule: Tensor | None,
+        schedule_idx: int,
+    ) -> dict[str, Tensor]:
+        if not self.config.use_synaptic_depression or depression_schedule is None:
+            return modulation
+        depression_mult = depression_schedule[schedule_idx]
+        base_weight_scale = modulation.get("weight_scale")
+        if base_weight_scale is None:
+            base_weight_scale = depression_mult.new_tensor(1.0)
+        elif not torch.is_tensor(base_weight_scale):
+            base_weight_scale = depression_mult.new_tensor(float(base_weight_scale))
+        modulation["weight_scale"] = base_weight_scale * depression_mult
+        return modulation
+
+    def _run_block_stack(
+        self,
+        h: Tensor,
+        *,
+        blocks: nn.ModuleList,
+        num_blocks: int,
+        cycle_idx: int,
+        x0: Tensor,
+        modulation: dict[str, Tensor],
+        block_offset: int = 0,
+        oscillation_step: int | None = None,
+        oscillation_schedule: Tensor | None = None,
+        use_skip_connections: bool = False,
+    ) -> Tensor:
+        cfg = self.config
+        skips: list[Tensor] = []
+        for block_idx in range(num_blocks):
+            param_block_idx = self._block_param_index(cycle_idx, block_idx, num_blocks)
+            block = blocks[param_block_idx]
+            block_mod = extract_block_modulation(modulation, block_idx, cfg, block_offset=block_offset)
+
+            if use_skip_connections and self.num_skip_weights > 0 and block_idx >= self.num_encoder_blocks:
+                decoder_idx = block_idx - self.num_encoder_blocks
+                if decoder_idx < self.num_skip_weights and skips:
+                    skip_weight = self.skip_weights[decoder_idx].to(dtype=h.dtype)[None, None, :]
+                    h = h + skip_weight * skips.pop()
+
+            if oscillation_schedule is not None and oscillation_step is not None:
+                osc_gate = oscillation_schedule[oscillation_step, block_idx]
+                base_residual_scale = block_mod.get("residual_scale")
+                if base_residual_scale is None:
+                    base_residual_scale = osc_gate.new_tensor(1.0)
+                elif not torch.is_tensor(base_residual_scale):
+                    base_residual_scale = osc_gate.new_tensor(float(base_residual_scale))
+                else:
+                    base_residual_scale = base_residual_scale.to(device=osc_gate.device, dtype=osc_gate.dtype)
+                block_mod["residual_scale"] = base_residual_scale * osc_gate
+
+            if "weight_scale" in modulation:
+                block_mod["weight_scale"] = modulation["weight_scale"]
+
+            h = block(h, x0=x0, modulation=block_mod)
+            if use_skip_connections and block_idx < self.num_encoder_blocks and len(skips) < self.num_skip_weights:
+                skips.append(h)
+        return h
 
     def forward(
         self,
@@ -239,8 +328,9 @@ class NeuroModRecursiveModel(nn.Module):
         prev_summary = input_summary
 
         # 3. Initialize tracking
-        h_prev = h
+        fast_h = h
         slow_h = h
+        controller_prev = fast_h if self.slow_blocks is None else 0.5 * (fast_h + slow_h)
         energy = torch.full((B, 1), cfg.energy_budget, device=device)
         inhibition_accum = torch.zeros(B, 1, 1, device=device)
         cumulative_halt_prob = torch.zeros(B, 1, device=device)
@@ -251,51 +341,53 @@ class NeuroModRecursiveModel(nn.Module):
         iteration_details = []
         latent_norms = []
         slow_norms = []
+        fast_steps_per_cycle = cfg.slow_update_interval if self.slow_blocks is not None else 1
+        total_fast_steps = cfg.max_iterations * fast_steps_per_cycle
+        total_modulation_steps = cfg.max_iterations * (fast_steps_per_cycle + (1 if self.slow_blocks is not None else 0))
+        equivalent_units_per_cycle = (
+            1.0
+            if self.slow_blocks is None
+            else fast_steps_per_cycle + (cfg.num_slow_blocks / max(cfg.num_shared_blocks, 1))
+        )
+
         depression_schedule = None
         if cfg.use_synaptic_depression:
-            exponents = torch.arange(cfg.max_iterations, device=device, dtype=h.dtype)
+            exponents = torch.arange(total_modulation_steps, device=device, dtype=fast_h.dtype)
             base = h.new_tensor(1.0 - self.synaptic_depression.depression_rate)
             depression_schedule = torch.pow(base, exponents)
         oscillation_schedule = None
         if cfg.use_oscillatory_gating:
-            oscillation_schedule = self.oscillatory_gating.all_gates(cfg.max_iterations, dtype=h.dtype)
+            oscillation_schedule = self.oscillatory_gating.all_gates(total_fast_steps, dtype=fast_h.dtype)
         iteration_schedule = None
         if self.modulator is not None and cfg.use_iteration_encoding:
             iteration_schedule = self.modulator.iteration_features(
-                cfg.max_iterations,
+                total_modulation_steps,
                 device=device,
                 dtype=input_summary.dtype,
             )
+        modulation_step = 0
+        fast_step_idx = 0
 
         # 4. Recursive loop
-        for i in range(cfg.max_iterations):
-            # 4a. Normalize hidden state between iterations (prevents compounding explosion)
-            h = self.iter_norm(h)
+        for slow_cycle in range(cfg.max_iterations):
+            fast_h = self.iter_norm(fast_h)
+            if self.slow_blocks is not None:
+                slow_h = self.iter_norm(slow_h)
             latent_residual = None
             latent_readout = None
             slow_summary = None
+            slow_modulation_stats = None
+            fast_modulation_stats = None
 
+            fast_summary_pre = fast_h.mean(dim=1)
             if self.slow_blocks is not None:
-                if i == 0 or (i % cfg.slow_update_interval) == 0:
-                    slow_input = 0.5 * (slow_h + h)
-                    for slow_block_idx in range(cfg.num_slow_blocks):
-                        param_block_idx = slow_block_idx if cfg.share_block_weights else (i * cfg.num_slow_blocks + slow_block_idx)
-                        slow_block = self.slow_blocks[param_block_idx]
-                        slow_input = slow_block(slow_input, x0=x0, modulation=None)
-                    slow_h = slow_input
                 slow_summary = slow_h.mean(dim=1)
-                slow_bridge = self.slow_to_fast(slow_summary)
-                slow_gate = torch.sigmoid(self.slow_gate(slow_summary))
-                h = h + (
-                    slow_bridge.unsqueeze(1)
-                    * slow_gate.unsqueeze(1)
-                    * self.slow_residual_scale.to(dtype=h.dtype)
-                )
-                slow_norms.append(slow_summary.norm(dim=-1).detach())
-
-            hidden_summary_pre = h.mean(dim=1)
+            controller_summary = (
+                fast_summary_pre
+                if slow_summary is None
+                else 0.5 * (fast_summary_pre + slow_summary)
+            )
             if self.latent_workspace is not None and latent_state is not None:
-                controller_summary = hidden_summary_pre if slow_summary is None else 0.5 * (hidden_summary_pre + slow_summary)
                 delta_summary = controller_summary - prev_summary
                 latent_state, latent_readout, latent_residual = self.latent_workspace(
                     latent_state,
@@ -303,104 +395,126 @@ class NeuroModRecursiveModel(nn.Module):
                     hidden_summary=controller_summary,
                     delta_summary=delta_summary,
                 )
-                h = h + latent_residual.unsqueeze(1).to(dtype=h.dtype)
                 latent_norms.append(latent_readout.norm(dim=-1).detach())
-            hidden_summary_full = h.mean(dim=1)
-            controller_hidden = hidden_summary_full if slow_summary is None else 0.5 * (hidden_summary_full + slow_summary)
-            hidden_summary = controller_hidden if cfg.use_adaptive_modulation else None
-            prev_summary = controller_hidden
+            prev_summary = controller_summary
 
-            # 4b. Generate modulation
-            iter_features = iteration_schedule[i] if iteration_schedule is not None else None
-            if self.modulator is not None:
-                modulation = self.modulator(
-                    input_summary,
-                    hidden_summary=hidden_summary,
-                    iteration_features=iter_features,
-                    latent_state=latent_readout,
+            if self.slow_blocks is not None:
+                slow_seed = slow_h
+                fast_to_slow = self.fast_to_slow(fast_summary_pre)
+                fast_gate = torch.sigmoid(self.fast_gate(fast_summary_pre))
+                slow_seed = slow_seed + (
+                    fast_to_slow.unsqueeze(1)
+                    * fast_gate.unsqueeze(1)
+                    * self.fast_residual_scale.to(dtype=slow_seed.dtype)
                 )
-            else:
-                modulation = {}
+                if latent_residual is not None:
+                    slow_seed = slow_seed + latent_residual.unsqueeze(1).to(dtype=slow_seed.dtype)
 
-            # Clamp modulation outputs to safe ranges
-            if "global_scale" in modulation:
-                modulation["global_scale"] = modulation["global_scale"].clamp(-2.0, 2.0)
-            if "global_shift" in modulation:
-                modulation["global_shift"] = modulation["global_shift"].clamp(-1.0, 1.0)
-            if "layer_scale" in modulation:
-                modulation["layer_scale"] = modulation["layer_scale"].clamp(0.1, 3.0)
-            if "layer_shift" in modulation:
-                modulation["layer_shift"] = modulation["layer_shift"].clamp(-1.0, 1.0)
+                slow_iter_features = iteration_schedule[modulation_step] if iteration_schedule is not None else None
+                if self.modulator is not None:
+                    slow_modulation = self.modulator(
+                        input_summary,
+                        hidden_summary=controller_summary if cfg.use_adaptive_modulation else None,
+                        iteration_features=slow_iter_features,
+                        latent_state=latent_readout,
+                    )
+                else:
+                    slow_modulation = {}
+                self._clamp_modulation(slow_modulation)
+                self._apply_weight_scale(slow_modulation, depression_schedule, modulation_step)
+                if return_details:
+                    slow_modulation_stats = _summarize_modulation(slow_modulation, B, device)
+                modulation_step += 1
+                slow_h = self._run_block_stack(
+                    slow_seed,
+                    blocks=self.slow_blocks,
+                    num_blocks=cfg.num_slow_blocks,
+                    cycle_idx=slow_cycle,
+                    x0=x0,
+                    modulation=slow_modulation,
+                    block_offset=cfg.num_shared_blocks,
+                    use_skip_connections=False,
+                )
+                slow_summary = slow_h.mean(dim=1)
+                slow_norms.append(slow_summary.norm(dim=-1).detach())
 
-            # 4c. Apply synaptic depression
-            if cfg.use_synaptic_depression:
-                depression_mult = depression_schedule[i]
-                base_weight_scale = modulation.get("weight_scale")
-                if base_weight_scale is None:
-                    base_weight_scale = depression_mult.new_tensor(1.0)
-                elif not torch.is_tensor(base_weight_scale):
-                    base_weight_scale = depression_mult.new_tensor(float(base_weight_scale))
-                modulation["weight_scale"] = base_weight_scale * depression_mult
-            modulation_stats = _summarize_modulation(modulation, B, device) if return_details else None
+            if latent_residual is not None:
+                fast_h = fast_h + latent_residual.unsqueeze(1).to(dtype=fast_h.dtype)
 
-            # 4d. Run shared blocks with modulation
-            skips: list[Tensor] = []
-            for block_idx in range(cfg.num_shared_blocks):
-                param_block_idx = block_idx if cfg.share_block_weights else (i * cfg.num_shared_blocks + block_idx)
-                block = self.shared_blocks[param_block_idx]
-                block_mod = extract_block_modulation(modulation, block_idx, cfg)
+            latest_modulation = {}
+            for _fast_inner in range(fast_steps_per_cycle):
+                fast_h = self.iter_norm(fast_h)
+                fast_summary = fast_h.mean(dim=1)
+                controller_hidden = (
+                    fast_summary
+                    if slow_summary is None
+                    else 0.5 * (fast_summary + slow_summary)
+                )
+                iter_features = iteration_schedule[modulation_step] if iteration_schedule is not None else None
+                if self.modulator is not None:
+                    fast_modulation = self.modulator(
+                        input_summary,
+                        hidden_summary=controller_hidden if cfg.use_adaptive_modulation else None,
+                        iteration_features=iter_features,
+                        latent_state=latent_readout,
+                    )
+                else:
+                    fast_modulation = {}
+                self._clamp_modulation(fast_modulation)
+                self._apply_weight_scale(fast_modulation, depression_schedule, modulation_step)
+                if return_details:
+                    fast_modulation_stats = _summarize_modulation(fast_modulation, B, device)
+                modulation_step += 1
+                latest_modulation = fast_modulation
 
-                if self.num_skip_weights > 0 and block_idx >= self.num_encoder_blocks:
-                    decoder_idx = block_idx - self.num_encoder_blocks
-                    if decoder_idx < self.num_skip_weights and skips:
-                        skip_weight = self.skip_weights[decoder_idx].to(dtype=h.dtype)[None, None, :]
-                        h = h + skip_weight * skips.pop()
+                if slow_summary is not None:
+                    slow_bridge = self.slow_to_fast(slow_summary)
+                    slow_gate = torch.sigmoid(self.slow_gate(slow_summary))
+                    fast_h = fast_h + (
+                        slow_bridge.unsqueeze(1)
+                        * slow_gate.unsqueeze(1)
+                        * self.slow_residual_scale.to(dtype=fast_h.dtype)
+                    )
 
-                # Oscillatory gating
-                if cfg.use_oscillatory_gating:
-                    osc_gate = oscillation_schedule[i, block_idx]
-                    base_residual_scale = block_mod.get("residual_scale")
-                    if base_residual_scale is None:
-                        base_residual_scale = osc_gate.new_tensor(1.0)
-                    elif not torch.is_tensor(base_residual_scale):
-                        base_residual_scale = osc_gate.new_tensor(float(base_residual_scale))
-                    else:
-                        base_residual_scale = base_residual_scale.to(device=osc_gate.device, dtype=osc_gate.dtype)
-                    block_mod["residual_scale"] = base_residual_scale * osc_gate
+                fast_prev = fast_h
+                fast_h = self._run_block_stack(
+                    fast_h,
+                    blocks=self.shared_blocks,
+                    num_blocks=cfg.num_shared_blocks,
+                    cycle_idx=slow_cycle,
+                    x0=x0,
+                    modulation=fast_modulation,
+                    oscillation_step=fast_step_idx if oscillation_schedule is not None else None,
+                    oscillation_schedule=oscillation_schedule,
+                    use_skip_connections=True,
+                )
 
-                # Weight scale from depression
-                if "weight_scale" in modulation:
-                    block_mod["weight_scale"] = modulation["weight_scale"]
+                if cfg.use_inhibitory_damping:
+                    fast_h, inhibition_accum = self.inhibitory_damping(fast_h, fast_prev, inhibition_accum)
+                fast_step_idx += 1
 
-                h = block(h, x0=x0, modulation=block_mod)
-                if block_idx < self.num_encoder_blocks and len(skips) < self.num_skip_weights:
-                    skips.append(h)
-
-            # 4d. Inhibitory damping
-            if cfg.use_inhibitory_damping:
-                h, inhibition_accum = self.inhibitory_damping(h, h_prev, inhibition_accum)
-
-            delta = (h - h_prev).norm(dim=(-2, -1))
-            delta_denom = h_prev.norm(dim=(-2, -1)) + 1e-8
+            controller_h = fast_h if slow_summary is None else 0.5 * (fast_h + slow_h)
+            delta = (controller_h - controller_prev).norm(dim=(-2, -1))
+            delta_denom = controller_prev.norm(dim=(-2, -1)) + 1e-8
             relative_delta = delta / delta_denom
-            hidden_norm = h.norm(dim=(-2, -1))
+            hidden_norm = controller_h.norm(dim=(-2, -1))
 
-            # 4e. Collect halt signals
+            # 4e. Collect halt signals after each slow cycle.
             halt_signals = {}
             if cfg.use_attractor_halt:
-                halt_signals["attractor"] = self.attractor_halt(h, h_prev)
+                halt_signals["attractor"] = self.attractor_halt(controller_h, controller_prev)
             if cfg.use_learned_halt:
-                halt_signals["learned"] = self.learned_halt(h)
+                halt_signals["learned"] = self.learned_halt(controller_h)
             if cfg.use_modulator_halt:
-                halt_signals["modulator"] = self.modulator_halt(modulation)
+                halt_signals["modulator"] = self.modulator_halt(latest_modulation)
             if cfg.use_energy_budget:
-                cost = self.energy_halt(h)  # (B, 1)
+                cost = self.energy_halt(controller_h)  # (B, 1)
                 energy = energy - cost
                 halt_signals["energy"] = (energy <= 0).float()
 
             # 4f. Combine halt signals
             should_halt, halt_prob = self.halt_combiner(halt_signals, batch_size=B, device=device)
-            if (i + 1) < cfg.min_iterations_before_halt:
+            if (slow_cycle + 1) < cfg.min_iterations_before_halt:
                 halt_prob = torch.zeros_like(halt_prob)
                 should_halt = torch.zeros_like(should_halt)
 
@@ -410,7 +524,7 @@ class NeuroModRecursiveModel(nn.Module):
             used_prob = torch.min(halt_prob, remainder)
             cumulative_halt_prob = cumulative_halt_prob + used_prob
 
-            hidden_states.append(h)
+            hidden_states.append(controller_h)
             halt_probs.append(used_prob)
 
             if return_details:
@@ -423,15 +537,18 @@ class NeuroModRecursiveModel(nn.Module):
                     "energy": energy.detach().clone() if cfg.use_energy_budget else None,
                     "delta_norm": relative_delta.detach(),
                     "hidden_norm": hidden_norm.detach(),
-                    "halt_enabled": torch.full((B, 1), float((i + 1) >= cfg.min_iterations_before_halt), device=device),
-                    "modulation_stats": {k: v.detach() for k, v in modulation_stats.items()} if modulation_stats else None,
+                    "halt_enabled": torch.full((B, 1), float((slow_cycle + 1) >= cfg.min_iterations_before_halt), device=device),
+                    "modulation_stats": {k: v.detach() for k, v in fast_modulation_stats.items()} if fast_modulation_stats else None,
+                    "fast_modulation_stats": {k: v.detach() for k, v in fast_modulation_stats.items()} if fast_modulation_stats else None,
+                    "slow_modulation_stats": {k: v.detach() for k, v in slow_modulation_stats.items()} if slow_modulation_stats else None,
                     "latent_norm": latent_readout.norm(dim=-1).detach() if latent_readout is not None else None,
                     "latent_residual_norm": latent_residual.norm(dim=-1).detach() if latent_residual is not None else None,
                     "slow_norm": slow_summary.norm(dim=-1).detach() if slow_summary is not None else None,
-                    "slow_update": torch.full((B, 1), float(self.slow_blocks is not None and (i == 0 or (i % cfg.slow_update_interval) == 0)), device=device),
+                    "slow_update": torch.full((B, 1), float(self.slow_blocks is not None), device=device),
+                    "fast_micro_steps": torch.full((B, 1), float(fast_steps_per_cycle), device=device),
                 })
 
-            h_prev = h
+            controller_prev = controller_h
 
             # During eval, hard-halt early if all samples halted
             if not self.training:
@@ -454,11 +571,13 @@ class NeuroModRecursiveModel(nn.Module):
             weights = halt_distribution.unsqueeze(-1).unsqueeze(-1)  # (B, num_iters, 1, 1)
             output_h = (states * weights).sum(dim=1)  # (B, T, D)
             step_ids = torch.arange(1, halt_distribution.size(-1) + 1, device=device, dtype=halt_distribution.dtype)
-            expected_iterations = (halt_distribution * step_ids.unsqueeze(0)).sum(dim=-1)
+            expected_slow_cycles = (halt_distribution * step_ids.unsqueeze(0)).sum(dim=-1)
+            expected_iterations = expected_slow_cycles * equivalent_units_per_cycle
         else:
-            output_h = h
+            output_h = fast_h if self.slow_blocks is None else 0.5 * (fast_h + slow_h)
             halt_distribution = torch.ones(B, 1, device=device, dtype=h.dtype)
-            expected_iterations = torch.ones(B, device=device, dtype=h.dtype)
+            expected_slow_cycles = torch.ones(B, device=device, dtype=fast_h.dtype)
+            expected_iterations = torch.full((B,), equivalent_units_per_cycle, device=device, dtype=fast_h.dtype)
 
         # 6. Output head
         logits = self.output_head(
@@ -468,8 +587,12 @@ class NeuroModRecursiveModel(nn.Module):
 
         details = {
             "expected_iterations": expected_iterations,
+            "expected_slow_cycles": expected_slow_cycles,
             "num_iterations": expected_iterations.detach().mean(),
             "iterations_executed": len(hidden_states),
+            "fast_steps_executed": fast_step_idx,
+            "slow_cycles_executed": len(hidden_states),
+            "equivalent_iterations_per_cycle": equivalent_units_per_cycle,
             "halt_probs": halt_probs,
             "halt_distribution": halt_distribution,
             "cumulative_halt_prob": cumulative_halt_prob,

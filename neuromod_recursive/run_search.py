@@ -83,7 +83,7 @@ def parse_args():
         "--preset",
         type=str,
         default="default",
-        choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_latent_competitive", "fineweb_baseline_parity"],
+        choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_latent_competitive", "fineweb_hrm_latent_competitive", "fineweb_baseline_parity"],
         help="Base config preset before applying any explicit overrides.",
     )
     parser.add_argument(
@@ -118,10 +118,10 @@ def parse_args():
     parser.add_argument("--latent-dim", type=int, default=None, help="Override latent workspace width")
     parser.add_argument("--latent-layers", type=int, default=None, help="Override latent workspace depth")
     parser.add_argument("--num-slow-blocks", type=int, default=None, help="Override number of slow hierarchical blocks")
-    parser.add_argument("--slow-update-interval", type=int, default=None, help="Update the slow path every N recursion steps")
+    parser.add_argument("--slow-update-interval", type=int, default=None, help="Number of fast inner cycles executed for each slow-cycle update")
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
     parser.add_argument("--num-shared-blocks", type=int, default=None, help="Override number of shared blocks")
-    parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive iterations")
+    parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive cycles (slow cycles when the fast/slow hierarchy is enabled)")
     parser.add_argument("--min-iterations-before-halt", type=int, default=None, help="Minimum recursive iterations before halting can trigger")
     parser.add_argument("--untie-block-weights", action="store_true", help="Use unique block weights at each recursion iteration instead of sharing them")
     parser.add_argument("--enable-smear-gate", action="store_true", help="Enable pre-attention token smear gating")
