@@ -133,20 +133,31 @@ class BigramHashEmbedding(nn.Module):
 
 
 class LatentWorkspace(nn.Module):
-    """Small recurrent latent workspace for iterative introspection and control."""
+    """Small recurrent latent workspace for iterative introspection and control.
 
-    def __init__(self, hidden_dim: int, latent_dim: int, latent_layers: int = 1):
+    The controller can optionally keep a short memory of past slow/controller
+    summaries and attend over that memory before applying each recurrent update.
+    """
+
+    def __init__(self, hidden_dim: int, latent_dim: int, latent_layers: int = 1, latent_memory_slots: int = 0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.latent_layers = latent_layers
+        self.latent_memory_slots = latent_memory_slots
         self.input_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
         self.hidden_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
         self.delta_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
-        self.input_adapter = CastedLinear(latent_dim * 3, latent_dim, bias=False)
+        adapter_in_dim = latent_dim * (4 if latent_memory_slots > 0 else 3)
+        self.input_adapter = CastedLinear(adapter_in_dim, latent_dim, bias=False)
         self.cores = nn.ModuleList(
             [nn.GRUCell(latent_dim, latent_dim) for _ in range(latent_layers)]
         )
+        if latent_memory_slots > 0:
+            self.memory_query = CastedLinear(latent_dim, latent_dim, bias=False)
+            self.memory_key = CastedLinear(latent_dim, latent_dim, bias=False)
+            self.memory_value = CastedLinear(latent_dim, latent_dim, bias=False)
+            self.memory_update = CastedLinear(hidden_dim, latent_dim, bias=False)
         self.to_hidden = CastedLinear(latent_dim, hidden_dim, bias=False)
         self.to_gate = nn.Linear(latent_dim, hidden_dim)
         self.residual_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
@@ -157,38 +168,109 @@ class LatentWorkspace(nn.Module):
         nn.init.zeros_(self.to_gate.weight)
         nn.init.constant_(self.to_gate.bias, -2.0)
 
-    def init_state(self, input_summary: Tensor) -> Tensor:
+    def init_state(self, input_summary: Tensor) -> dict[str, Tensor]:
         base = torch.tanh(self.input_proj(input_summary))
-        return base.unsqueeze(1).expand(-1, self.latent_layers, -1).contiguous().clone()
+        layers = base.unsqueeze(1).expand(-1, self.latent_layers, -1).contiguous().clone()
+        state = {"layers": layers}
+        if self.latent_memory_slots > 0:
+            memory = torch.zeros(
+                input_summary.size(0),
+                self.latent_memory_slots,
+                self.latent_dim,
+                device=input_summary.device,
+                dtype=input_summary.dtype,
+            )
+            memory[:, -1, :] = torch.tanh(self.memory_update(input_summary))
+            memory_counts = torch.ones(input_summary.size(0), device=input_summary.device, dtype=torch.long)
+            state["memory"] = memory
+            state["memory_counts"] = memory_counts
+        return state
+
+    def _memory_context(
+        self,
+        query_source: Tensor,
+        memory: Tensor,
+        memory_counts: Tensor,
+    ) -> Tensor:
+        if self.latent_memory_slots <= 0:
+            return query_source.new_zeros(query_source.shape)
+
+        query = self.memory_query(query_source).unsqueeze(1)
+        keys = self.memory_key(memory)
+        values = self.memory_value(memory)
+        scores = torch.matmul(query, keys.transpose(-1, -2)).squeeze(1)
+        positions = torch.arange(self.latent_memory_slots, device=memory.device).unsqueeze(0)
+        valid_from = (self.latent_memory_slots - memory_counts).unsqueeze(1)
+        valid_mask = positions >= valid_from
+        scores = scores.masked_fill(~valid_mask, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        attn = torch.where(valid_mask, attn, torch.zeros_like(attn))
+        denom = attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        attn = attn / denom
+        return torch.bmm(attn.unsqueeze(1), values).squeeze(1)
+
+    def _update_memory(
+        self,
+        memory: Tensor,
+        memory_counts: Tensor,
+        hidden_summary: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        memory_token = torch.tanh(self.memory_update(hidden_summary)).unsqueeze(1)
+        updated_memory = torch.cat([memory[:, 1:, :], memory_token], dim=1)
+        updated_counts = torch.clamp(memory_counts + 1, max=self.latent_memory_slots)
+        return updated_memory, updated_counts
 
     def forward(
         self,
-        latent_state: Tensor,
+        latent_state: dict[str, Tensor] | Tensor,
         input_summary: Tensor,
         hidden_summary: Tensor,
         delta_summary: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        update_in = torch.cat(
-            [
-                self.input_proj(input_summary),
-                self.hidden_proj(hidden_summary),
-                self.delta_proj(delta_summary),
-            ],
-            dim=-1,
-        )
+    ) -> tuple[dict[str, Tensor], Tensor, Tensor]:
+        if isinstance(latent_state, dict):
+            layer_state = latent_state["layers"]
+            memory = latent_state.get("memory")
+            memory_counts = latent_state.get("memory_counts")
+        else:
+            layer_state = latent_state
+            memory = None
+            memory_counts = None
+
+        input_proj = self.input_proj(input_summary)
+        hidden_proj = self.hidden_proj(hidden_summary)
+        delta_proj = self.delta_proj(delta_summary)
+        parts = [input_proj, hidden_proj, delta_proj]
+        if self.latent_memory_slots > 0:
+            if memory is None or memory_counts is None:
+                memory = torch.zeros(
+                    input_summary.size(0),
+                    self.latent_memory_slots,
+                    self.latent_dim,
+                    device=input_summary.device,
+                    dtype=input_summary.dtype,
+                )
+                memory_counts = torch.zeros(input_summary.size(0), device=input_summary.device, dtype=torch.long)
+            memory_context = self._memory_context(hidden_proj, memory, memory_counts)
+            parts.append(memory_context)
+        update_in = torch.cat(parts, dim=-1)
         x = torch.tanh(self.input_adapter(update_in))
         next_states: list[Tensor] = []
         for layer_idx, core in enumerate(self.cores):
-            prev_state = latent_state[:, layer_idx, :]
+            prev_state = layer_state[:, layer_idx, :]
             x = core(x, prev_state)
             x = F.rms_norm(x, (x.size(-1),))
             next_states.append(x)
         stacked_state = torch.stack(next_states, dim=1)
         latent_readout = stacked_state[:, -1, :]
+        next_state: dict[str, Tensor] = {"layers": stacked_state}
+        if self.latent_memory_slots > 0 and memory is not None and memory_counts is not None:
+            next_memory, next_counts = self._update_memory(memory, memory_counts, hidden_summary)
+            next_state["memory"] = next_memory
+            next_state["memory_counts"] = next_counts
         latent_hidden = self.to_hidden(latent_readout)
         latent_gate = torch.sigmoid(self.to_gate(latent_readout))
         latent_residual = latent_hidden * latent_gate * self.residual_scale.to(dtype=latent_hidden.dtype)
-        return stacked_state, latent_readout, latent_residual
+        return next_state, latent_readout, latent_residual
 
 
 class SharedTransformerBlock(nn.Module):

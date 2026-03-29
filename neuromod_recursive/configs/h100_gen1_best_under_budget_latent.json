@@ -19,6 +19,7 @@
   "use_latent_workspace": true,
   "latent_dim": 64,
   "latent_layers": 2,
+  "latent_memory_slots": 4,
   "use_fast_slow_hierarchy": true,
   "num_slow_blocks": 1,
   "slow_update_interval": 2,

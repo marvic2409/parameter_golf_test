@@ -96,7 +96,12 @@ class NeuroModRecursiveModel(nn.Module):
         )
         self.smear_gate = SmearGate(config.hidden_dim) if config.use_smear_gate else None
         self.latent_workspace = (
-            LatentWorkspace(config.hidden_dim, config.latent_dim, config.latent_layers)
+            LatentWorkspace(
+                config.hidden_dim,
+                config.latent_dim,
+                config.latent_layers,
+                config.latent_memory_slots,
+            )
             if config.use_latent_workspace
             else None
         )

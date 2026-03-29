@@ -117,6 +117,7 @@ def parse_args():
     parser.add_argument("--bigram-hash-dim", type=int, default=None, help="Override hashed bigram embedding dimension")
     parser.add_argument("--latent-dim", type=int, default=None, help="Override latent workspace width")
     parser.add_argument("--latent-layers", type=int, default=None, help="Override latent workspace depth")
+    parser.add_argument("--latent-memory-slots", type=int, default=None, help="Override latent memory length for attending over past slow/controller states")
     parser.add_argument("--num-slow-blocks", type=int, default=None, help="Override number of slow hierarchical blocks")
     parser.add_argument("--slow-update-interval", type=int, default=None, help="Number of fast inner cycles executed for each slow-cycle update")
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
@@ -196,6 +197,7 @@ def build_base_config(args) -> NeuroModConfig:
         "bigram_hash_dim": args.bigram_hash_dim,
         "latent_dim": args.latent_dim,
         "latent_layers": args.latent_layers,
+        "latent_memory_slots": args.latent_memory_slots,
         "num_slow_blocks": args.num_slow_blocks,
         "slow_update_interval": args.slow_update_interval,
         "mod_dim": args.mod_dim,
@@ -340,7 +342,7 @@ def main():
         f"hidden_dim={base_config.hidden_dim} "
         f"heads={base_config.num_heads}/{base_config.num_kv_heads} ff_mult={base_config.ff_mult} "
         f"bigram={base_config.bigram_hash_buckets}x{base_config.bigram_hash_dim} "
-        f"latent={base_config.use_latent_workspace}:{base_config.latent_dim}x{base_config.latent_layers} "
+        f"latent={base_config.use_latent_workspace}:{base_config.latent_dim}x{base_config.latent_layers}+m{base_config.latent_memory_slots} "
         f"slow={base_config.use_fast_slow_hierarchy}:{base_config.num_slow_blocks}@{base_config.slow_update_interval} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
         f"min_halt={base_config.min_iterations_before_halt} "
