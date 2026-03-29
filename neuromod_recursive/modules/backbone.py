@@ -132,6 +132,53 @@ class BigramHashEmbedding(nn.Module):
         return hidden * self.scale.to(dtype=hidden.dtype)
 
 
+class LatentWorkspace(nn.Module):
+    """Small recurrent latent workspace for iterative introspection and control."""
+
+    def __init__(self, hidden_dim: int, latent_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.input_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
+        self.hidden_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
+        self.delta_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
+        self.core = nn.GRUCell(latent_dim * 3, latent_dim)
+        self.to_hidden = CastedLinear(latent_dim, hidden_dim, bias=False)
+        self.to_gate = nn.Linear(latent_dim, hidden_dim)
+        self.residual_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.zeros_(self.to_hidden.weight)
+        nn.init.zeros_(self.to_gate.weight)
+        nn.init.constant_(self.to_gate.bias, -2.0)
+
+    def init_state(self, input_summary: Tensor) -> Tensor:
+        return torch.tanh(self.input_proj(input_summary))
+
+    def forward(
+        self,
+        latent_state: Tensor,
+        input_summary: Tensor,
+        hidden_summary: Tensor,
+        delta_summary: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        update_in = torch.cat(
+            [
+                self.input_proj(input_summary),
+                self.hidden_proj(hidden_summary),
+                self.delta_proj(delta_summary),
+            ],
+            dim=-1,
+        )
+        latent_state = self.core(update_in, latent_state)
+        latent_state = F.rms_norm(latent_state, (latent_state.size(-1),))
+        latent_hidden = self.to_hidden(latent_state)
+        latent_gate = torch.sigmoid(self.to_gate(latent_state))
+        latent_residual = latent_hidden * latent_gate * self.residual_scale.to(dtype=latent_hidden.dtype)
+        return latent_state, latent_residual
+
+
 class SharedTransformerBlock(nn.Module):
     """Single pre-norm transformer block with modulation hooks.
 

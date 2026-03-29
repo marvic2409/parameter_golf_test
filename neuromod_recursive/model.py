@@ -13,6 +13,7 @@ from .config import NeuroModConfig
 from .modules.backbone import (
     BigramHashEmbedding,
     Embedding,
+    LatentWorkspace,
     OutputHead,
     SharedTransformerBlock,
     SmearGate,
@@ -93,6 +94,11 @@ class NeuroModRecursiveModel(nn.Module):
             else None
         )
         self.smear_gate = SmearGate(config.hidden_dim) if config.use_smear_gate else None
+        self.latent_workspace = (
+            LatentWorkspace(config.hidden_dim, config.latent_dim)
+            if config.use_latent_workspace
+            else None
+        )
 
         self.num_encoder_blocks = config.num_shared_blocks // 2
         self.num_decoder_blocks = config.num_shared_blocks - self.num_encoder_blocks
@@ -199,6 +205,8 @@ class NeuroModRecursiveModel(nn.Module):
 
         # 2. Initial modulator context
         input_summary = h.mean(dim=1)  # (B, D)
+        latent_state = self.latent_workspace.init_state(input_summary) if self.latent_workspace is not None else None
+        prev_summary = input_summary
 
         # 3. Initialize tracking
         h_prev = h
@@ -210,6 +218,7 @@ class NeuroModRecursiveModel(nn.Module):
         hidden_states = []
         halt_probs = []
         iteration_details = []
+        latent_norms = []
         depression_schedule = None
         if cfg.use_synaptic_depression:
             exponents = torch.arange(cfg.max_iterations, device=device, dtype=h.dtype)
@@ -230,15 +239,30 @@ class NeuroModRecursiveModel(nn.Module):
         for i in range(cfg.max_iterations):
             # 4a. Normalize hidden state between iterations (prevents compounding explosion)
             h = self.iter_norm(h)
+            latent_residual = None
+            hidden_summary_pre = h.mean(dim=1)
+            if self.latent_workspace is not None and latent_state is not None:
+                delta_summary = hidden_summary_pre - prev_summary
+                latent_state, latent_residual = self.latent_workspace(
+                    latent_state,
+                    input_summary=input_summary,
+                    hidden_summary=hidden_summary_pre,
+                    delta_summary=delta_summary,
+                )
+                h = h + latent_residual.unsqueeze(1).to(dtype=h.dtype)
+                latent_norms.append(latent_state.norm(dim=-1).detach())
+            hidden_summary_full = h.mean(dim=1)
+            hidden_summary = hidden_summary_full if cfg.use_adaptive_modulation else None
+            prev_summary = hidden_summary_full
 
             # 4b. Generate modulation
-            hidden_summary = h.mean(dim=1) if cfg.use_adaptive_modulation else None
             iter_features = iteration_schedule[i] if iteration_schedule is not None else None
             if self.modulator is not None:
                 modulation = self.modulator(
                     input_summary,
                     hidden_summary=hidden_summary,
                     iteration_features=iter_features,
+                    latent_state=latent_state,
                 )
             else:
                 modulation = {}
@@ -346,6 +370,8 @@ class NeuroModRecursiveModel(nn.Module):
                     "hidden_norm": hidden_norm.detach(),
                     "halt_enabled": torch.full((B, 1), float((i + 1) >= cfg.min_iterations_before_halt), device=device),
                     "modulation_stats": {k: v.detach() for k, v in modulation_stats.items()} if modulation_stats else None,
+                    "latent_norm": latent_state.norm(dim=-1).detach() if latent_state is not None else None,
+                    "latent_residual_norm": latent_residual.norm(dim=-1).detach() if latent_residual is not None else None,
                 })
 
             h_prev = h
@@ -390,6 +416,11 @@ class NeuroModRecursiveModel(nn.Module):
             "halt_probs": halt_probs,
             "halt_distribution": halt_distribution,
             "cumulative_halt_prob": cumulative_halt_prob,
+            "latent_state_norm": (
+                torch.stack(latent_norms, dim=1).mean(dim=1)
+                if latent_norms
+                else None
+            ),
         }
         if return_details:
             details["iteration_details"] = iteration_details

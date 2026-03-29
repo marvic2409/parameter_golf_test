@@ -34,7 +34,7 @@ from .utils import format_param_count, get_device
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark one recursive-search candidate and extrapolate")
-    parser.add_argument("--preset", choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_baseline_parity"], default="fineweb_medium")
+    parser.add_argument("--preset", choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_latent_competitive", "fineweb_baseline_parity"], default="fineweb_medium")
     parser.add_argument("--use-fineweb", action="store_true", help="Benchmark with real FineWeb data")
     parser.add_argument("--data-path", type=str, default="./data/datasets/fineweb10B_sp1024")
     parser.add_argument("--tokenizer-path", type=str, default="./data/tokenizers/fineweb_1024_bpe.model")

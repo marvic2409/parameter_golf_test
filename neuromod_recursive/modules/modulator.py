@@ -31,12 +31,16 @@ class ModulatorNetwork(nn.Module):
         # Adaptive modulation: project current hidden state
         if config.use_adaptive_modulation:
             self.hidden_proj = nn.Linear(hidden_dim, mod_dim)
+        if config.use_latent_workspace:
+            self.latent_proj = nn.Linear(config.latent_dim, mod_dim)
 
         # Compute MLP input size
         mlp_in = mod_dim  # input summary always present
         if config.use_iteration_encoding:
             mlp_in += mod_dim
         if config.use_adaptive_modulation:
+            mlp_in += mod_dim
+        if config.use_latent_workspace:
             mlp_in += mod_dim
 
         # Core MLP (2 layers, hidden 64)
@@ -116,6 +120,7 @@ class ModulatorNetwork(nn.Module):
         input_summary: Tensor,     # (B, hidden_dim) — mean-pooled input embeddings
         hidden_summary: Optional[Tensor] = None,  # (B, hidden_dim) — mean-pooled current hidden
         iteration_features: Optional[Tensor] = None,
+        latent_state: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         cfg = self.config
         B = input_summary.shape[0]
@@ -130,6 +135,10 @@ class ModulatorNetwork(nn.Module):
 
         if cfg.use_adaptive_modulation and hidden_summary is not None:
             parts.append(self.hidden_proj(hidden_summary))
+        if cfg.use_latent_workspace:
+            if latent_state is None:
+                raise ValueError("latent_state must be provided when latent workspace is enabled")
+            parts.append(self.latent_proj(latent_state))
 
         mlp_in = torch.cat(parts, dim=-1)
         features = self.mlp(mlp_in)  # (B, 64)

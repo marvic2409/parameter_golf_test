@@ -82,7 +82,7 @@ def parse_args():
         "--preset",
         type=str,
         default="default",
-        choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_baseline_parity"],
+        choices=["default", "fineweb_medium", "fineweb_large", "fineweb_competitive", "fineweb_latent_competitive", "fineweb_baseline_parity"],
         help="Base config preset before applying any explicit overrides.",
     )
     parser.add_argument(
@@ -114,6 +114,7 @@ def parse_args():
     parser.add_argument("--ff-mult", type=float, default=None, help="Override FFN expansion multiplier")
     parser.add_argument("--bigram-hash-buckets", type=int, default=None, help="Override hashed bigram vocabulary size (0 disables)")
     parser.add_argument("--bigram-hash-dim", type=int, default=None, help="Override hashed bigram embedding dimension")
+    parser.add_argument("--latent-dim", type=int, default=None, help="Override latent workspace width")
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
     parser.add_argument("--num-shared-blocks", type=int, default=None, help="Override number of shared blocks")
     parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive iterations")
@@ -121,6 +122,8 @@ def parse_args():
     parser.add_argument("--untie-block-weights", action="store_true", help="Use unique block weights at each recursion iteration instead of sharing them")
     parser.add_argument("--enable-smear-gate", action="store_true", help="Enable pre-attention token smear gating")
     parser.add_argument("--disable-smear-gate", action="store_true", help="Disable pre-attention token smear gating")
+    parser.add_argument("--enable-latent-workspace", action="store_true", help="Enable the recurrent latent workspace")
+    parser.add_argument("--disable-latent-workspace", action="store_true", help="Disable the recurrent latent workspace")
     parser.add_argument("--disable-residual-mix", action="store_true", help="Disable trainable residual mixing with the input stream")
     parser.add_argument("--disable-block-skips", action="store_true", help="Disable U-Net style skip connections across recursive blocks")
     parser.add_argument("--batch-size", type=int, default=None, help="Override per-process batch size")
@@ -185,6 +188,7 @@ def build_base_config(args) -> NeuroModConfig:
         "ff_mult": args.ff_mult,
         "bigram_hash_buckets": args.bigram_hash_buckets,
         "bigram_hash_dim": args.bigram_hash_dim,
+        "latent_dim": args.latent_dim,
         "mod_dim": args.mod_dim,
         "num_shared_blocks": args.num_shared_blocks,
         "max_iterations": args.max_iterations,
@@ -214,6 +218,10 @@ def build_base_config(args) -> NeuroModConfig:
         config.use_smear_gate = True
     if args.disable_smear_gate:
         config.use_smear_gate = False
+    if args.enable_latent_workspace:
+        config.use_latent_workspace = True
+    if args.disable_latent_workspace:
+        config.use_latent_workspace = False
     if args.disable_residual_mix:
         config.use_residual_mix = False
     if args.disable_block_skips:
@@ -317,6 +325,7 @@ def main():
         f"hidden_dim={base_config.hidden_dim} "
         f"heads={base_config.num_heads}/{base_config.num_kv_heads} ff_mult={base_config.ff_mult} "
         f"bigram={base_config.bigram_hash_buckets}x{base_config.bigram_hash_dim} "
+        f"latent={base_config.use_latent_workspace}:{base_config.latent_dim} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
         f"min_halt={base_config.min_iterations_before_halt} "
         f"shared_weights={base_config.share_block_weights} "

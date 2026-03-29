@@ -29,6 +29,8 @@ class NeuroModConfig:
     bigram_hash_buckets: int = 0
     bigram_hash_dim: int = 128
     use_smear_gate: bool = False
+    use_latent_workspace: bool = False
+    latent_dim: int = 64
     use_residual_mix: bool = True
     use_block_skip_connections: bool = True
     eval_stride: int = 0
@@ -102,6 +104,7 @@ class NeuroModConfig:
         return sum([
             self.bigram_hash_buckets > 0,
             self.use_smear_gate,
+            self.use_latent_workspace,
             self.use_residual_mix,
             self.use_block_skip_connections,
             self.use_global_modulation, self.use_layer_modulation,
@@ -135,6 +138,7 @@ class MutationSettings:
 BOOLEAN_PARAMS = [
     "share_block_weights",
     "use_smear_gate",
+    "use_latent_workspace",
     "use_residual_mix",
     "use_block_skip_connections",
     "use_global_modulation", "use_layer_modulation", "use_channel_gating",
@@ -167,6 +171,7 @@ CATEGORICAL_PARAMS = {
     "mod_dim": [8, 16, 32],
     "bigram_hash_buckets": [0, 2048, 4096, 8192],
     "bigram_hash_dim": [64, 128, 256],
+    "latent_dim": [32, 64, 96, 128],
     "max_iterations": [3, 4, 6, 8, 10, 12],
     "min_iterations_before_halt": [1, 2, 3, 4, 6, 8],
     "num_shared_blocks": [1, 2, 3],
@@ -182,7 +187,7 @@ SEARCH_SPACE_SPECS = {
         "boolean": list(BOOLEAN_PARAMS),
         "continuous": ["iteration_cost"],
         "categorical": [
-            "halt_combination", "mod_dim", "bigram_hash_buckets", "max_iterations",
+            "halt_combination", "mod_dim", "bigram_hash_buckets", "latent_dim", "max_iterations",
             "min_iterations_before_halt", "num_shared_blocks",
         ],
     },
@@ -214,6 +219,7 @@ def normalize_config(config: NeuroModConfig) -> NeuroModConfig:
     config.num_shared_blocks = max(1, int(config.num_shared_blocks))
     config.bigram_hash_buckets = max(0, int(config.bigram_hash_buckets))
     config.bigram_hash_dim = max(1, int(config.bigram_hash_dim))
+    config.latent_dim = max(8, int(config.latent_dim))
     config.eval_stride = max(0, int(config.eval_stride))
     config.swa_every = max(1, int(config.swa_every))
     return config
@@ -408,6 +414,33 @@ def make_preset_config(name: str) -> NeuroModConfig:
         cfg.bigram_hash_buckets = 4096
         cfg.bigram_hash_dim = 128
         cfg.use_smear_gate = True
+        cfg.use_residual_mix = True
+        cfg.use_block_skip_connections = True
+        cfg.mod_dim = 32
+        cfg.num_shared_blocks = 3
+        cfg.max_iterations = 8
+        cfg.min_iterations_before_halt = 2
+        cfg.batch_size = 6
+        cfg.lr = 1.2e-4
+        cfg.warmup_steps = 700
+        cfg.num_cycles = 3
+        cfg.min_lr_ratio = 0.08
+        cfg.iteration_cost = 0.0015
+        cfg.eval_stride = 64
+        cfg.swa_enabled = True
+        cfg.swa_start_frac = 0.5
+        cfg.swa_every = 50
+        return normalize_config(cfg)
+    if name == "fineweb_latent_competitive":
+        cfg.hidden_dim = 640
+        cfg.num_heads = 10
+        cfg.num_kv_heads = 5
+        cfg.ff_mult = 3.0
+        cfg.bigram_hash_buckets = 4096
+        cfg.bigram_hash_dim = 128
+        cfg.use_smear_gate = True
+        cfg.use_latent_workspace = True
+        cfg.latent_dim = 64
         cfg.use_residual_mix = True
         cfg.use_block_skip_connections = True
         cfg.mod_dim = 32
