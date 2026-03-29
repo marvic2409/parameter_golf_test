@@ -12,6 +12,7 @@ from torch import Tensor
 from .config import NeuroModConfig
 from .modules.backbone import (
     BigramHashEmbedding,
+    CastedLinear,
     Embedding,
     LatentWorkspace,
     OutputHead,
@@ -99,6 +100,10 @@ class NeuroModRecursiveModel(nn.Module):
             if config.use_latent_workspace
             else None
         )
+        self.slow_blocks = None
+        self.slow_to_fast = None
+        self.slow_gate = None
+        self.slow_residual_scale = None
 
         self.num_encoder_blocks = config.num_shared_blocks // 2
         self.num_decoder_blocks = config.num_shared_blocks - self.num_encoder_blocks
@@ -126,6 +131,28 @@ class NeuroModRecursiveModel(nn.Module):
             )
             for _ in range(block_param_count)
         ])
+        if config.use_fast_slow_hierarchy:
+            slow_block_param_count = (
+                config.num_slow_blocks
+                if config.share_block_weights
+                else config.num_slow_blocks * config.max_iterations
+            )
+            self.slow_blocks = nn.ModuleList([
+                SharedTransformerBlock(
+                    config.hidden_dim,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.ff_mult,
+                    use_rotary_embeddings=config.use_rotary_embeddings,
+                    qk_gain_init=config.qk_gain_init,
+                    use_residual_mix=False,
+                )
+                for _ in range(slow_block_param_count)
+            ])
+            self.slow_to_fast = CastedLinear(config.hidden_dim, config.hidden_dim, bias=False)
+            self.slow_to_fast._zero_init = True
+            self.slow_gate = nn.Linear(config.hidden_dim, config.hidden_dim)
+            self.slow_residual_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
         # --- Modulator ---
         self.modulator = ModulatorNetwork(config) if self.modulation_enabled else None
@@ -160,6 +187,9 @@ class NeuroModRecursiveModel(nn.Module):
             logit_softcap=config.logit_softcap,
         )
         self._init_weights()
+        if self.slow_gate is not None:
+            nn.init.zeros_(self.slow_gate.weight)
+            nn.init.constant_(self.slow_gate.bias, -2.0)
 
     def _init_weights(self) -> None:
         total_layers = max(len(self.shared_blocks), 1)
@@ -210,6 +240,7 @@ class NeuroModRecursiveModel(nn.Module):
 
         # 3. Initialize tracking
         h_prev = h
+        slow_h = h
         energy = torch.full((B, 1), cfg.energy_budget, device=device)
         inhibition_accum = torch.zeros(B, 1, 1, device=device)
         cumulative_halt_prob = torch.zeros(B, 1, device=device)
@@ -219,6 +250,7 @@ class NeuroModRecursiveModel(nn.Module):
         halt_probs = []
         iteration_details = []
         latent_norms = []
+        slow_norms = []
         depression_schedule = None
         if cfg.use_synaptic_depression:
             exponents = torch.arange(cfg.max_iterations, device=device, dtype=h.dtype)
@@ -241,20 +273,42 @@ class NeuroModRecursiveModel(nn.Module):
             h = self.iter_norm(h)
             latent_residual = None
             latent_readout = None
+            slow_summary = None
+
+            if self.slow_blocks is not None:
+                if i == 0 or (i % cfg.slow_update_interval) == 0:
+                    slow_input = 0.5 * (slow_h + h)
+                    for slow_block_idx in range(cfg.num_slow_blocks):
+                        param_block_idx = slow_block_idx if cfg.share_block_weights else (i * cfg.num_slow_blocks + slow_block_idx)
+                        slow_block = self.slow_blocks[param_block_idx]
+                        slow_input = slow_block(slow_input, x0=x0, modulation=None)
+                    slow_h = slow_input
+                slow_summary = slow_h.mean(dim=1)
+                slow_bridge = self.slow_to_fast(slow_summary)
+                slow_gate = torch.sigmoid(self.slow_gate(slow_summary))
+                h = h + (
+                    slow_bridge.unsqueeze(1)
+                    * slow_gate.unsqueeze(1)
+                    * self.slow_residual_scale.to(dtype=h.dtype)
+                )
+                slow_norms.append(slow_summary.norm(dim=-1).detach())
+
             hidden_summary_pre = h.mean(dim=1)
             if self.latent_workspace is not None and latent_state is not None:
-                delta_summary = hidden_summary_pre - prev_summary
+                controller_summary = hidden_summary_pre if slow_summary is None else 0.5 * (hidden_summary_pre + slow_summary)
+                delta_summary = controller_summary - prev_summary
                 latent_state, latent_readout, latent_residual = self.latent_workspace(
                     latent_state,
                     input_summary=input_summary,
-                    hidden_summary=hidden_summary_pre,
+                    hidden_summary=controller_summary,
                     delta_summary=delta_summary,
                 )
                 h = h + latent_residual.unsqueeze(1).to(dtype=h.dtype)
                 latent_norms.append(latent_readout.norm(dim=-1).detach())
             hidden_summary_full = h.mean(dim=1)
-            hidden_summary = hidden_summary_full if cfg.use_adaptive_modulation else None
-            prev_summary = hidden_summary_full
+            controller_hidden = hidden_summary_full if slow_summary is None else 0.5 * (hidden_summary_full + slow_summary)
+            hidden_summary = controller_hidden if cfg.use_adaptive_modulation else None
+            prev_summary = controller_hidden
 
             # 4b. Generate modulation
             iter_features = iteration_schedule[i] if iteration_schedule is not None else None
@@ -373,6 +427,8 @@ class NeuroModRecursiveModel(nn.Module):
                     "modulation_stats": {k: v.detach() for k, v in modulation_stats.items()} if modulation_stats else None,
                     "latent_norm": latent_readout.norm(dim=-1).detach() if latent_readout is not None else None,
                     "latent_residual_norm": latent_residual.norm(dim=-1).detach() if latent_residual is not None else None,
+                    "slow_norm": slow_summary.norm(dim=-1).detach() if slow_summary is not None else None,
+                    "slow_update": torch.full((B, 1), float(self.slow_blocks is not None and (i == 0 or (i % cfg.slow_update_interval) == 0)), device=device),
                 })
 
             h_prev = h
@@ -420,6 +476,11 @@ class NeuroModRecursiveModel(nn.Module):
             "latent_state_norm": (
                 torch.stack(latent_norms, dim=1).mean(dim=1)
                 if latent_norms
+                else None
+            ),
+            "slow_state_norm": (
+                torch.stack(slow_norms, dim=1).mean(dim=1)
+                if slow_norms
                 else None
             ),
         }

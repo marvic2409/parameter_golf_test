@@ -32,6 +32,9 @@ class NeuroModConfig:
     use_latent_workspace: bool = False
     latent_dim: int = 64
     latent_layers: int = 1
+    use_fast_slow_hierarchy: bool = False
+    num_slow_blocks: int = 1
+    slow_update_interval: int = 2
     use_residual_mix: bool = True
     use_block_skip_connections: bool = True
     eval_stride: int = 0
@@ -106,6 +109,7 @@ class NeuroModConfig:
             self.bigram_hash_buckets > 0,
             self.use_smear_gate,
             self.use_latent_workspace,
+            self.use_fast_slow_hierarchy,
             self.use_residual_mix,
             self.use_block_skip_connections,
             self.use_global_modulation, self.use_layer_modulation,
@@ -140,6 +144,7 @@ BOOLEAN_PARAMS = [
     "share_block_weights",
     "use_smear_gate",
     "use_latent_workspace",
+    "use_fast_slow_hierarchy",
     "use_residual_mix",
     "use_block_skip_connections",
     "use_global_modulation", "use_layer_modulation", "use_channel_gating",
@@ -174,6 +179,8 @@ CATEGORICAL_PARAMS = {
     "bigram_hash_dim": [64, 128, 256],
     "latent_dim": [32, 64, 96, 128],
     "latent_layers": [1, 2, 3, 4],
+    "num_slow_blocks": [1, 2, 3],
+    "slow_update_interval": [1, 2, 3, 4],
     "max_iterations": [3, 4, 6, 8, 10, 12],
     "min_iterations_before_halt": [1, 2, 3, 4, 6, 8],
     "num_shared_blocks": [1, 2, 3],
@@ -189,7 +196,8 @@ SEARCH_SPACE_SPECS = {
         "boolean": list(BOOLEAN_PARAMS),
         "continuous": ["iteration_cost"],
         "categorical": [
-            "halt_combination", "mod_dim", "bigram_hash_buckets", "latent_dim", "latent_layers", "max_iterations",
+            "halt_combination", "mod_dim", "bigram_hash_buckets", "latent_dim", "latent_layers",
+            "num_slow_blocks", "slow_update_interval", "max_iterations",
             "min_iterations_before_halt", "num_shared_blocks",
         ],
     },
@@ -223,6 +231,8 @@ def normalize_config(config: NeuroModConfig) -> NeuroModConfig:
     config.bigram_hash_dim = max(1, int(config.bigram_hash_dim))
     config.latent_dim = max(8, int(config.latent_dim))
     config.latent_layers = max(1, int(config.latent_layers))
+    config.num_slow_blocks = max(1, int(config.num_slow_blocks))
+    config.slow_update_interval = max(1, int(config.slow_update_interval))
     config.eval_stride = max(0, int(config.eval_stride))
     config.swa_every = max(1, int(config.swa_every))
     return config
@@ -445,6 +455,9 @@ def make_preset_config(name: str) -> NeuroModConfig:
         cfg.use_latent_workspace = True
         cfg.latent_dim = 64
         cfg.latent_layers = 2
+        cfg.use_fast_slow_hierarchy = True
+        cfg.num_slow_blocks = 1
+        cfg.slow_update_interval = 2
         cfg.use_residual_mix = True
         cfg.use_block_skip_connections = True
         cfg.mod_dim = 32

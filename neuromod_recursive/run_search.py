@@ -117,6 +117,8 @@ def parse_args():
     parser.add_argument("--bigram-hash-dim", type=int, default=None, help="Override hashed bigram embedding dimension")
     parser.add_argument("--latent-dim", type=int, default=None, help="Override latent workspace width")
     parser.add_argument("--latent-layers", type=int, default=None, help="Override latent workspace depth")
+    parser.add_argument("--num-slow-blocks", type=int, default=None, help="Override number of slow hierarchical blocks")
+    parser.add_argument("--slow-update-interval", type=int, default=None, help="Update the slow path every N recursion steps")
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
     parser.add_argument("--num-shared-blocks", type=int, default=None, help="Override number of shared blocks")
     parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive iterations")
@@ -126,6 +128,8 @@ def parse_args():
     parser.add_argument("--disable-smear-gate", action="store_true", help="Disable pre-attention token smear gating")
     parser.add_argument("--enable-latent-workspace", action="store_true", help="Enable the recurrent latent workspace")
     parser.add_argument("--disable-latent-workspace", action="store_true", help="Disable the recurrent latent workspace")
+    parser.add_argument("--enable-fast-slow-hierarchy", action="store_true", help="Enable separate fast and slow recurrent block stacks")
+    parser.add_argument("--disable-fast-slow-hierarchy", action="store_true", help="Disable the fast/slow hierarchical block split")
     parser.add_argument("--disable-residual-mix", action="store_true", help="Disable trainable residual mixing with the input stream")
     parser.add_argument("--disable-block-skips", action="store_true", help="Disable U-Net style skip connections across recursive blocks")
     parser.add_argument("--batch-size", type=int, default=None, help="Override per-process batch size")
@@ -192,6 +196,8 @@ def build_base_config(args) -> NeuroModConfig:
         "bigram_hash_dim": args.bigram_hash_dim,
         "latent_dim": args.latent_dim,
         "latent_layers": args.latent_layers,
+        "num_slow_blocks": args.num_slow_blocks,
+        "slow_update_interval": args.slow_update_interval,
         "mod_dim": args.mod_dim,
         "num_shared_blocks": args.num_shared_blocks,
         "max_iterations": args.max_iterations,
@@ -225,6 +231,10 @@ def build_base_config(args) -> NeuroModConfig:
         config.use_latent_workspace = True
     if args.disable_latent_workspace:
         config.use_latent_workspace = False
+    if args.enable_fast_slow_hierarchy:
+        config.use_fast_slow_hierarchy = True
+    if args.disable_fast_slow_hierarchy:
+        config.use_fast_slow_hierarchy = False
     if args.disable_residual_mix:
         config.use_residual_mix = False
     if args.disable_block_skips:
@@ -331,6 +341,7 @@ def main():
         f"heads={base_config.num_heads}/{base_config.num_kv_heads} ff_mult={base_config.ff_mult} "
         f"bigram={base_config.bigram_hash_buckets}x{base_config.bigram_hash_dim} "
         f"latent={base_config.use_latent_workspace}:{base_config.latent_dim}x{base_config.latent_layers} "
+        f"slow={base_config.use_fast_slow_hierarchy}:{base_config.num_slow_blocks}@{base_config.slow_update_interval} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
         f"min_halt={base_config.min_iterations_before_halt} "
         f"shared_weights={base_config.share_block_weights} "
