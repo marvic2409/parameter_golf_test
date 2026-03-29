@@ -115,6 +115,7 @@ def parse_args():
     parser.add_argument("--bigram-hash-buckets", type=int, default=None, help="Override hashed bigram vocabulary size (0 disables)")
     parser.add_argument("--bigram-hash-dim", type=int, default=None, help="Override hashed bigram embedding dimension")
     parser.add_argument("--latent-dim", type=int, default=None, help="Override latent workspace width")
+    parser.add_argument("--latent-layers", type=int, default=None, help="Override latent workspace depth")
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
     parser.add_argument("--num-shared-blocks", type=int, default=None, help="Override number of shared blocks")
     parser.add_argument("--max-iterations", type=int, default=None, help="Override max recursive iterations")
@@ -189,6 +190,7 @@ def build_base_config(args) -> NeuroModConfig:
         "bigram_hash_buckets": args.bigram_hash_buckets,
         "bigram_hash_dim": args.bigram_hash_dim,
         "latent_dim": args.latent_dim,
+        "latent_layers": args.latent_layers,
         "mod_dim": args.mod_dim,
         "num_shared_blocks": args.num_shared_blocks,
         "max_iterations": args.max_iterations,
@@ -325,7 +327,7 @@ def main():
         f"hidden_dim={base_config.hidden_dim} "
         f"heads={base_config.num_heads}/{base_config.num_kv_heads} ff_mult={base_config.ff_mult} "
         f"bigram={base_config.bigram_hash_buckets}x{base_config.bigram_hash_dim} "
-        f"latent={base_config.use_latent_workspace}:{base_config.latent_dim} "
+        f"latent={base_config.use_latent_workspace}:{base_config.latent_dim}x{base_config.latent_layers} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
         f"min_halt={base_config.min_iterations_before_halt} "
         f"shared_weights={base_config.share_block_weights} "

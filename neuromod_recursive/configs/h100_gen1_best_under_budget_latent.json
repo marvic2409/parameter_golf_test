@@ -18,6 +18,7 @@
   "use_smear_gate": true,
   "use_latent_workspace": true,
   "latent_dim": 64,
+  "latent_layers": 2,
   "use_residual_mix": false,
   "use_block_skip_connections": false,
   "eval_stride": 64,

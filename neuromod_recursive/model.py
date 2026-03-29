@@ -95,7 +95,7 @@ class NeuroModRecursiveModel(nn.Module):
         )
         self.smear_gate = SmearGate(config.hidden_dim) if config.use_smear_gate else None
         self.latent_workspace = (
-            LatentWorkspace(config.hidden_dim, config.latent_dim)
+            LatentWorkspace(config.hidden_dim, config.latent_dim, config.latent_layers)
             if config.use_latent_workspace
             else None
         )
@@ -240,17 +240,18 @@ class NeuroModRecursiveModel(nn.Module):
             # 4a. Normalize hidden state between iterations (prevents compounding explosion)
             h = self.iter_norm(h)
             latent_residual = None
+            latent_readout = None
             hidden_summary_pre = h.mean(dim=1)
             if self.latent_workspace is not None and latent_state is not None:
                 delta_summary = hidden_summary_pre - prev_summary
-                latent_state, latent_residual = self.latent_workspace(
+                latent_state, latent_readout, latent_residual = self.latent_workspace(
                     latent_state,
                     input_summary=input_summary,
                     hidden_summary=hidden_summary_pre,
                     delta_summary=delta_summary,
                 )
                 h = h + latent_residual.unsqueeze(1).to(dtype=h.dtype)
-                latent_norms.append(latent_state.norm(dim=-1).detach())
+                latent_norms.append(latent_readout.norm(dim=-1).detach())
             hidden_summary_full = h.mean(dim=1)
             hidden_summary = hidden_summary_full if cfg.use_adaptive_modulation else None
             prev_summary = hidden_summary_full
@@ -262,7 +263,7 @@ class NeuroModRecursiveModel(nn.Module):
                     input_summary,
                     hidden_summary=hidden_summary,
                     iteration_features=iter_features,
-                    latent_state=latent_state,
+                    latent_state=latent_readout,
                 )
             else:
                 modulation = {}
@@ -370,7 +371,7 @@ class NeuroModRecursiveModel(nn.Module):
                     "hidden_norm": hidden_norm.detach(),
                     "halt_enabled": torch.full((B, 1), float((i + 1) >= cfg.min_iterations_before_halt), device=device),
                     "modulation_stats": {k: v.detach() for k, v in modulation_stats.items()} if modulation_stats else None,
-                    "latent_norm": latent_state.norm(dim=-1).detach() if latent_state is not None else None,
+                    "latent_norm": latent_readout.norm(dim=-1).detach() if latent_readout is not None else None,
                     "latent_residual_norm": latent_residual.norm(dim=-1).detach() if latent_residual is not None else None,
                 })
 

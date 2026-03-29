@@ -135,14 +135,18 @@ class BigramHashEmbedding(nn.Module):
 class LatentWorkspace(nn.Module):
     """Small recurrent latent workspace for iterative introspection and control."""
 
-    def __init__(self, hidden_dim: int, latent_dim: int):
+    def __init__(self, hidden_dim: int, latent_dim: int, latent_layers: int = 1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.latent_layers = latent_layers
         self.input_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
         self.hidden_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
         self.delta_proj = CastedLinear(hidden_dim, latent_dim, bias=False)
-        self.core = nn.GRUCell(latent_dim * 3, latent_dim)
+        self.input_adapter = CastedLinear(latent_dim * 3, latent_dim, bias=False)
+        self.cores = nn.ModuleList(
+            [nn.GRUCell(latent_dim, latent_dim) for _ in range(latent_layers)]
+        )
         self.to_hidden = CastedLinear(latent_dim, hidden_dim, bias=False)
         self.to_gate = nn.Linear(latent_dim, hidden_dim)
         self.residual_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
@@ -154,7 +158,8 @@ class LatentWorkspace(nn.Module):
         nn.init.constant_(self.to_gate.bias, -2.0)
 
     def init_state(self, input_summary: Tensor) -> Tensor:
-        return torch.tanh(self.input_proj(input_summary))
+        base = torch.tanh(self.input_proj(input_summary))
+        return base.unsqueeze(1).expand(-1, self.latent_layers, -1).contiguous().clone()
 
     def forward(
         self,
@@ -162,7 +167,7 @@ class LatentWorkspace(nn.Module):
         input_summary: Tensor,
         hidden_summary: Tensor,
         delta_summary: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         update_in = torch.cat(
             [
                 self.input_proj(input_summary),
@@ -171,12 +176,19 @@ class LatentWorkspace(nn.Module):
             ],
             dim=-1,
         )
-        latent_state = self.core(update_in, latent_state)
-        latent_state = F.rms_norm(latent_state, (latent_state.size(-1),))
-        latent_hidden = self.to_hidden(latent_state)
-        latent_gate = torch.sigmoid(self.to_gate(latent_state))
+        x = torch.tanh(self.input_adapter(update_in))
+        next_states: list[Tensor] = []
+        for layer_idx, core in enumerate(self.cores):
+            prev_state = latent_state[:, layer_idx, :]
+            x = core(x, prev_state)
+            x = F.rms_norm(x, (x.size(-1),))
+            next_states.append(x)
+        stacked_state = torch.stack(next_states, dim=1)
+        latent_readout = stacked_state[:, -1, :]
+        latent_hidden = self.to_hidden(latent_readout)
+        latent_gate = torch.sigmoid(self.to_gate(latent_readout))
         latent_residual = latent_hidden * latent_gate * self.residual_scale.to(dtype=latent_hidden.dtype)
-        return latent_state, latent_residual
+        return stacked_state, latent_readout, latent_residual
 
 
 class SharedTransformerBlock(nn.Module):
