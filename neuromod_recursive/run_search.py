@@ -33,6 +33,7 @@ from .config import (
     make_preset_config,
     normalize_config,
 )
+from .compression import measure_compressed_size
 from .model import NeuroModRecursiveModel, count_parameters
 from .search import run_evolutionary_search
 from .train import train_single_config, train_distributed
@@ -320,6 +321,8 @@ def main():
         preview_config.seq_len = fineweb_setup["seq_len"]
     preview_model = NeuroModRecursiveModel(preview_config)
     preview_params = count_parameters(preview_model)
+    preview_size_stats = measure_compressed_size(preview_model)
+    preview_size_mb = preview_size_stats["zlib_compressed_bytes"] / 1_000_000
     del preview_model
 
     print(
@@ -335,7 +338,7 @@ def main():
         f"skips={base_config.use_block_skip_connections} eval_stride={base_config.eval_stride} "
         f"swa={base_config.swa_enabled} "
         f"batch_size={base_config.batch_size} lr={base_config.lr:g} "
-        f"params={format_param_count(preview_params)}"
+        f"params={format_param_count(preview_params)} size={preview_size_mb:.2f}MB"
     )
 
     # --- Single config training ---
@@ -347,7 +350,8 @@ def main():
             config.seq_len = fineweb_setup["seq_len"]
         model = NeuroModRecursiveModel(config)
         params = count_parameters(model)
-        print(f"Parameters: {format_param_count(params)}")
+        size_stats = measure_compressed_size(model)
+        print(f"Parameters: {format_param_count(params)} | size={size_stats['zlib_compressed_bytes'] / 1_000_000:.2f}MB")
         del model
 
         if args.distributed:
@@ -370,6 +374,8 @@ def main():
         print(f"\nFinal val_loss: {result['val_loss']:.4f}")
         if result.get("val_bpb") is not None:
             print(f"Final val_bpb:  {result['val_bpb']:.4f}  (this is the challenge score)")
+        if result.get("compressed_mb") is not None:
+            print(f"Final size:     {result['compressed_mb']:.2f}MB")
         return
 
     # --- Evolutionary search ---

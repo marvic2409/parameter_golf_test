@@ -20,6 +20,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .config import NeuroModConfig
+from .compression import measure_compressed_size
 from .data import generate_mixed_batch
 from .evaluate import evaluate_model
 from .model import NeuroModRecursiveModel, compute_loss, count_parameters
@@ -611,6 +612,9 @@ def train_single_config(
         progress_label=None if quiet else "final eval",
     )
     exported_model = unwrap_model(model)
+    size_stats = measure_compressed_size(exported_model)
+    compressed_bytes = int(size_stats["zlib_compressed_bytes"])
+    compressed_mb = compressed_bytes / 1_000_000
 
     if final_eval_setup is not None:
         result = {
@@ -623,10 +627,13 @@ def train_single_config(
             "elapsed_seconds": elapsed,
             "model": exported_model,
             "selected_checkpoint": chosen_label,
+            "compressed_bytes": compressed_bytes,
+            "compressed_mb": compressed_mb,
         }
         if not quiet:
             print(f"\n  Final: val_loss={result['val_loss']:.4f} | val_bpb={result['val_bpb']:.4f} | "
-                  f"avg_iters={avg_iterations_run:.1f} | checkpoint={chosen_label} | time={elapsed:.1f}s")
+                  f"avg_iters={avg_iterations_run:.1f} | size={compressed_mb:.2f}MB | "
+                  f"checkpoint={chosen_label} | time={elapsed:.1f}s")
     else:
         result = {
             "val_loss": eval_result["val_loss"],
@@ -638,10 +645,12 @@ def train_single_config(
             "elapsed_seconds": elapsed,
             "model": exported_model,
             "selected_checkpoint": chosen_label,
+            "compressed_bytes": compressed_bytes,
+            "compressed_mb": compressed_mb,
         }
         if not quiet:
             print(f"\n  Final: val_loss={result['val_loss']:.4f} | "
-                  f"avg_iters={result['avg_iterations']:.1f} | checkpoint={chosen_label} | "
+                  f"avg_iters={result['avg_iterations']:.1f} | size={compressed_mb:.2f}MB | checkpoint={chosen_label} | "
                   f"time={elapsed:.1f}s")
 
     return result
@@ -827,9 +836,14 @@ def train_distributed(
         "elapsed_seconds": elapsed,
         "model": base_model,
     }
+    if is_master:
+        size_stats = measure_compressed_size(base_model)
+        result["compressed_bytes"] = int(size_stats["zlib_compressed_bytes"])
+        result["compressed_mb"] = result["compressed_bytes"] / 1_000_000
 
     if is_master:
         bpb_str = f" | val_bpb={result['val_bpb']:.4f}" if result["val_bpb"] is not None else ""
-        print(f"\n  Final: val_loss={result['val_loss']:.4f}{bpb_str} | time={elapsed:.1f}s")
+        size_str = f" | size={result['compressed_mb']:.2f}MB" if result.get("compressed_mb") is not None else ""
+        print(f"\n  Final: val_loss={result['val_loss']:.4f}{bpb_str}{size_str} | time={elapsed:.1f}s")
 
     return result
