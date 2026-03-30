@@ -21,6 +21,8 @@
   "latent_layers": 3,
   "latent_memory_slots": 8,
   "use_fast_slow_hierarchy": true,
+  "use_dynamic_coordinator": true,
+  "coordinator_dim": 64,
   "num_slow_blocks": 2,
   "slow_update_interval": 2,
   "use_residual_mix": true,

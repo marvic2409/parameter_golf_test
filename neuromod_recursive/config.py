@@ -34,6 +34,8 @@ class NeuroModConfig:
     latent_layers: int = 1
     latent_memory_slots: int = 0
     use_fast_slow_hierarchy: bool = False
+    use_dynamic_coordinator: bool = False
+    coordinator_dim: int = 64
     num_slow_blocks: int = 1
     slow_update_interval: int = 2
     use_residual_mix: bool = True
@@ -111,6 +113,7 @@ class NeuroModConfig:
             self.use_smear_gate,
             self.use_latent_workspace,
             self.use_fast_slow_hierarchy,
+            self.use_dynamic_coordinator,
             self.use_residual_mix,
             self.use_block_skip_connections,
             self.use_global_modulation, self.use_layer_modulation,
@@ -146,6 +149,7 @@ BOOLEAN_PARAMS = [
     "use_smear_gate",
     "use_latent_workspace",
     "use_fast_slow_hierarchy",
+    "use_dynamic_coordinator",
     "use_residual_mix",
     "use_block_skip_connections",
     "use_global_modulation", "use_layer_modulation", "use_channel_gating",
@@ -181,6 +185,7 @@ CATEGORICAL_PARAMS = {
     "latent_dim": [32, 64, 96, 128],
     "latent_layers": [1, 2, 3, 4],
     "latent_memory_slots": [0, 2, 4, 8],
+    "coordinator_dim": [32, 64, 96],
     "num_slow_blocks": [1, 2, 3],
     "slow_update_interval": [1, 2, 3, 4],
     "max_iterations": [3, 4, 6, 8, 10, 12],
@@ -199,6 +204,7 @@ SEARCH_SPACE_SPECS = {
         "continuous": ["iteration_cost"],
         "categorical": [
             "halt_combination", "mod_dim", "bigram_hash_buckets", "latent_dim", "latent_layers", "latent_memory_slots",
+            "coordinator_dim",
             "num_slow_blocks", "slow_update_interval", "max_iterations",
             "min_iterations_before_halt", "num_shared_blocks",
         ],
@@ -234,8 +240,11 @@ def normalize_config(config: NeuroModConfig) -> NeuroModConfig:
     config.latent_dim = max(8, int(config.latent_dim))
     config.latent_layers = max(1, int(config.latent_layers))
     config.latent_memory_slots = max(0, int(config.latent_memory_slots))
+    config.coordinator_dim = max(8, int(config.coordinator_dim))
     config.num_slow_blocks = max(1, int(config.num_slow_blocks))
     config.slow_update_interval = max(1, int(config.slow_update_interval))
+    if not config.use_fast_slow_hierarchy:
+        config.use_dynamic_coordinator = False
     config.eval_stride = max(0, int(config.eval_stride))
     config.swa_every = max(1, int(config.swa_every))
     return config
@@ -492,6 +501,8 @@ def make_preset_config(name: str) -> NeuroModConfig:
         cfg.latent_layers = 3
         cfg.latent_memory_slots = 8
         cfg.use_fast_slow_hierarchy = True
+        cfg.use_dynamic_coordinator = True
+        cfg.coordinator_dim = 64
         cfg.num_slow_blocks = 2
         cfg.slow_update_interval = 2
         cfg.use_residual_mix = True

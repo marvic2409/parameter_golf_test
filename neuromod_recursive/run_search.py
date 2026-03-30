@@ -118,6 +118,7 @@ def parse_args():
     parser.add_argument("--latent-dim", type=int, default=None, help="Override latent workspace width")
     parser.add_argument("--latent-layers", type=int, default=None, help="Override latent workspace depth")
     parser.add_argument("--latent-memory-slots", type=int, default=None, help="Override latent memory length for attending over past slow/controller states")
+    parser.add_argument("--coordinator-dim", type=int, default=None, help="Override dynamic coordinator hidden width")
     parser.add_argument("--num-slow-blocks", type=int, default=None, help="Override number of slow hierarchical blocks")
     parser.add_argument("--slow-update-interval", type=int, default=None, help="Number of fast inner cycles executed for each slow-cycle update")
     parser.add_argument("--mod-dim", type=int, default=None, help="Override modulation code dimension")
@@ -131,6 +132,8 @@ def parse_args():
     parser.add_argument("--disable-latent-workspace", action="store_true", help="Disable the recurrent latent workspace")
     parser.add_argument("--enable-fast-slow-hierarchy", action="store_true", help="Enable separate fast and slow recurrent block stacks")
     parser.add_argument("--disable-fast-slow-hierarchy", action="store_true", help="Disable the fast/slow hierarchical block split")
+    parser.add_argument("--enable-dynamic-coordinator", action="store_true", help="Enable a learned coordinator that schedules slow and fast updates")
+    parser.add_argument("--disable-dynamic-coordinator", action="store_true", help="Disable the learned slow/fast coordinator")
     parser.add_argument("--disable-residual-mix", action="store_true", help="Disable trainable residual mixing with the input stream")
     parser.add_argument("--disable-block-skips", action="store_true", help="Disable U-Net style skip connections across recursive blocks")
     parser.add_argument("--batch-size", type=int, default=None, help="Override per-process batch size")
@@ -198,6 +201,7 @@ def build_base_config(args) -> NeuroModConfig:
         "latent_dim": args.latent_dim,
         "latent_layers": args.latent_layers,
         "latent_memory_slots": args.latent_memory_slots,
+        "coordinator_dim": args.coordinator_dim,
         "num_slow_blocks": args.num_slow_blocks,
         "slow_update_interval": args.slow_update_interval,
         "mod_dim": args.mod_dim,
@@ -237,6 +241,10 @@ def build_base_config(args) -> NeuroModConfig:
         config.use_fast_slow_hierarchy = True
     if args.disable_fast_slow_hierarchy:
         config.use_fast_slow_hierarchy = False
+    if args.enable_dynamic_coordinator:
+        config.use_dynamic_coordinator = True
+    if args.disable_dynamic_coordinator:
+        config.use_dynamic_coordinator = False
     if args.disable_residual_mix:
         config.use_residual_mix = False
     if args.disable_block_skips:
@@ -344,6 +352,7 @@ def main():
         f"bigram={base_config.bigram_hash_buckets}x{base_config.bigram_hash_dim} "
         f"latent={base_config.use_latent_workspace}:{base_config.latent_dim}x{base_config.latent_layers}+m{base_config.latent_memory_slots} "
         f"slow={base_config.use_fast_slow_hierarchy}:{base_config.num_slow_blocks}@{base_config.slow_update_interval} "
+        f"coord={base_config.use_dynamic_coordinator}:{base_config.coordinator_dim} "
         f"shared_blocks={base_config.num_shared_blocks} max_iterations={base_config.max_iterations} "
         f"min_halt={base_config.min_iterations_before_halt} "
         f"shared_weights={base_config.share_block_weights} "

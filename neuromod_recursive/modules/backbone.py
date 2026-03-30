@@ -273,6 +273,54 @@ class LatentWorkspace(nn.Module):
         return next_state, latent_readout, latent_residual
 
 
+class DynamicCoordinator(nn.Module):
+    """Learns how much slow/fast computation to use each slow cycle."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        max_fast_steps: int,
+        coordinator_dim: int = 64,
+        latent_dim: int | None = None,
+    ):
+        super().__init__()
+        self.max_fast_steps = max_fast_steps
+        in_dim = hidden_dim * 2 + (latent_dim or 0)
+        self.input_proj = CastedLinear(in_dim, coordinator_dim, bias=False)
+        self.mlp = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(coordinator_dim, coordinator_dim),
+            nn.GELU(),
+        )
+        self.slow_gate = nn.Linear(coordinator_dim, 1)
+        self.fast_gate = nn.Linear(coordinator_dim, max_fast_steps)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.zeros_(self.slow_gate.weight)
+        nn.init.constant_(self.slow_gate.bias, 2.0)
+        nn.init.zeros_(self.fast_gate.weight)
+        with torch.no_grad():
+            self.fast_gate.bias.copy_(torch.linspace(2.0, 1.0, self.max_fast_steps))
+
+    def forward(
+        self,
+        fast_summary: Tensor,
+        slow_summary: Tensor,
+        latent_readout: Optional[Tensor] = None,
+    ) -> dict[str, Tensor]:
+        parts = [fast_summary, slow_summary]
+        if latent_readout is not None:
+            parts.append(latent_readout)
+        features = self.mlp(self.input_proj(torch.cat(parts, dim=-1)))
+        slow_mix = torch.sigmoid(self.slow_gate(features))
+        fast_gates = torch.sigmoid(self.fast_gate(features))
+        return {
+            "slow_mix": slow_mix,
+            "fast_gates": fast_gates,
+        }
+
+
 class SharedTransformerBlock(nn.Module):
     """Single pre-norm transformer block with modulation hooks.
 

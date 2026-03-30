@@ -13,6 +13,7 @@ from .config import NeuroModConfig
 from .modules.backbone import (
     BigramHashEmbedding,
     CastedLinear,
+    DynamicCoordinator,
     Embedding,
     LatentWorkspace,
     OutputHead,
@@ -108,6 +109,7 @@ class NeuroModRecursiveModel(nn.Module):
         self.slow_blocks = None
         self.fast_to_slow = None
         self.fast_gate = None
+        self.dynamic_coordinator = None
         self.slow_to_fast = None
         self.slow_gate = None
         self.fast_residual_scale = None
@@ -160,6 +162,13 @@ class NeuroModRecursiveModel(nn.Module):
             self.fast_to_slow = CastedLinear(config.hidden_dim, config.hidden_dim, bias=False)
             self.fast_to_slow._zero_init = True
             self.fast_gate = nn.Linear(config.hidden_dim, config.hidden_dim)
+            if config.use_dynamic_coordinator:
+                self.dynamic_coordinator = DynamicCoordinator(
+                    hidden_dim=config.hidden_dim,
+                    max_fast_steps=config.slow_update_interval,
+                    coordinator_dim=config.coordinator_dim,
+                    latent_dim=config.latent_dim if config.use_latent_workspace else None,
+                )
             self.slow_to_fast = CastedLinear(config.hidden_dim, config.hidden_dim, bias=False)
             self.slow_to_fast._zero_init = True
             self.slow_gate = nn.Linear(config.hidden_dim, config.hidden_dim)
@@ -346,6 +355,7 @@ class NeuroModRecursiveModel(nn.Module):
         iteration_details = []
         latent_norms = []
         slow_norms = []
+        cycle_compute_costs = []
         fast_steps_per_cycle = cfg.slow_update_interval if self.slow_blocks is not None else 1
         total_fast_steps = cfg.max_iterations * fast_steps_per_cycle
         total_modulation_steps = cfg.max_iterations * (fast_steps_per_cycle + (1 if self.slow_blocks is not None else 0))
@@ -383,6 +393,8 @@ class NeuroModRecursiveModel(nn.Module):
             slow_summary = None
             slow_modulation_stats = None
             fast_modulation_stats = None
+            slow_mix = torch.ones(B, 1, device=device, dtype=fast_h.dtype)
+            fast_gate_schedule = torch.ones(B, fast_steps_per_cycle, device=device, dtype=fast_h.dtype)
 
             fast_summary_pre = fast_h.mean(dim=1)
             if self.slow_blocks is not None:
@@ -403,7 +415,17 @@ class NeuroModRecursiveModel(nn.Module):
                 latent_norms.append(latent_readout.norm(dim=-1).detach())
             prev_summary = controller_summary
 
+            if self.dynamic_coordinator is not None and slow_summary is not None:
+                coordinator_outputs = self.dynamic_coordinator(
+                    fast_summary_pre,
+                    slow_summary,
+                    latent_readout=latent_readout,
+                )
+                slow_mix = coordinator_outputs["slow_mix"].to(dtype=fast_h.dtype)
+                fast_gate_schedule = coordinator_outputs["fast_gates"].to(dtype=fast_h.dtype)
+
             if self.slow_blocks is not None:
+                prev_slow_h = slow_h
                 slow_seed = slow_h
                 fast_to_slow = self.fast_to_slow(fast_summary_pre)
                 fast_gate = torch.sigmoid(self.fast_gate(fast_summary_pre))
@@ -430,7 +452,7 @@ class NeuroModRecursiveModel(nn.Module):
                 if return_details:
                     slow_modulation_stats = _summarize_modulation(slow_modulation, B, device)
                 modulation_step += 1
-                slow_h = self._run_block_stack(
+                slow_candidate = self._run_block_stack(
                     slow_seed,
                     blocks=self.slow_blocks,
                     num_blocks=cfg.num_slow_blocks,
@@ -440,6 +462,7 @@ class NeuroModRecursiveModel(nn.Module):
                     block_offset=cfg.num_shared_blocks,
                     use_skip_connections=False,
                 )
+                slow_h = prev_slow_h + slow_mix.unsqueeze(1) * (slow_candidate - prev_slow_h)
                 slow_summary = slow_h.mean(dim=1)
                 slow_norms.append(slow_summary.norm(dim=-1).detach())
 
@@ -482,7 +505,7 @@ class NeuroModRecursiveModel(nn.Module):
                     )
 
                 fast_prev = fast_h
-                fast_h = self._run_block_stack(
+                fast_candidate = self._run_block_stack(
                     fast_h,
                     blocks=self.shared_blocks,
                     num_blocks=cfg.num_shared_blocks,
@@ -495,10 +518,20 @@ class NeuroModRecursiveModel(nn.Module):
                 )
 
                 if cfg.use_inhibitory_damping:
-                    fast_h, inhibition_accum = self.inhibitory_damping(fast_h, fast_prev, inhibition_accum)
+                    fast_candidate, inhibition_accum = self.inhibitory_damping(fast_candidate, fast_prev, inhibition_accum)
+                fast_gate_step = fast_gate_schedule[:, _fast_inner].view(B, 1, 1).to(dtype=fast_candidate.dtype)
+                fast_h = fast_prev + fast_gate_step * (fast_candidate - fast_prev)
                 fast_step_idx += 1
 
             controller_h = fast_h if slow_summary is None else 0.5 * (fast_h + slow_h)
+            slow_compute = (
+                slow_mix.squeeze(-1) * (cfg.num_slow_blocks / max(cfg.num_shared_blocks, 1))
+                if self.slow_blocks is not None
+                else torch.zeros(B, device=device, dtype=fast_h.dtype)
+            )
+            fast_compute = fast_gate_schedule.sum(dim=-1)
+            cycle_compute = fast_compute + slow_compute
+            cycle_compute_costs.append(cycle_compute)
             delta = (controller_h - controller_prev).norm(dim=(-2, -1))
             delta_denom = controller_prev.norm(dim=(-2, -1)) + 1e-8
             relative_delta = delta / delta_denom
@@ -549,8 +582,8 @@ class NeuroModRecursiveModel(nn.Module):
                     "latent_norm": latent_readout.norm(dim=-1).detach() if latent_readout is not None else None,
                     "latent_residual_norm": latent_residual.norm(dim=-1).detach() if latent_residual is not None else None,
                     "slow_norm": slow_summary.norm(dim=-1).detach() if slow_summary is not None else None,
-                    "slow_update": torch.full((B, 1), float(self.slow_blocks is not None), device=device),
-                    "fast_micro_steps": torch.full((B, 1), float(fast_steps_per_cycle), device=device),
+                    "slow_update": slow_mix.detach(),
+                    "fast_micro_steps": fast_gate_schedule.detach(),
                 })
 
             controller_prev = controller_h
@@ -577,12 +610,16 @@ class NeuroModRecursiveModel(nn.Module):
             output_h = (states * weights).sum(dim=1)  # (B, T, D)
             step_ids = torch.arange(1, halt_distribution.size(-1) + 1, device=device, dtype=halt_distribution.dtype)
             expected_slow_cycles = (halt_distribution * step_ids.unsqueeze(0)).sum(dim=-1)
-            expected_iterations = expected_slow_cycles * equivalent_units_per_cycle
+            cycle_compute_tensor = torch.stack(cycle_compute_costs, dim=1)
+            expected_iterations = (halt_distribution * cycle_compute_tensor).sum(dim=-1)
         else:
             output_h = fast_h if self.slow_blocks is None else 0.5 * (fast_h + slow_h)
             halt_distribution = torch.ones(B, 1, device=device, dtype=h.dtype)
             expected_slow_cycles = torch.ones(B, device=device, dtype=fast_h.dtype)
-            expected_iterations = torch.full((B,), equivalent_units_per_cycle, device=device, dtype=fast_h.dtype)
+            if cycle_compute_costs:
+                expected_iterations = cycle_compute_costs[-1]
+            else:
+                expected_iterations = torch.full((B,), equivalent_units_per_cycle, device=device, dtype=fast_h.dtype)
 
         # 6. Output head
         logits = self.output_head(
@@ -597,7 +634,11 @@ class NeuroModRecursiveModel(nn.Module):
             "iterations_executed": len(hidden_states),
             "fast_steps_executed": fast_step_idx,
             "slow_cycles_executed": len(hidden_states),
-            "equivalent_iterations_per_cycle": equivalent_units_per_cycle,
+            "equivalent_iterations_per_cycle": (
+                torch.stack(cycle_compute_costs, dim=1).mean().detach()
+                if cycle_compute_costs
+                else torch.tensor(equivalent_units_per_cycle, device=device, dtype=fast_h.dtype)
+            ),
             "halt_probs": halt_probs,
             "halt_distribution": halt_distribution,
             "cumulative_halt_prob": cumulative_halt_prob,
