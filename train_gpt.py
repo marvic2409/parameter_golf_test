@@ -831,6 +831,12 @@ def main() -> None:
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    cuda_device_count = torch.cuda.device_count()
+    if local_rank >= cuda_device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} but only {cuda_device_count} CUDA devices are visible. "
+            f"Use --nproc_per_node <= {cuda_device_count} or fix CUDA_VISIBLE_DEVICES."
+        )
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:

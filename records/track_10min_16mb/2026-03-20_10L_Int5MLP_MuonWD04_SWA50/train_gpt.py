@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
 import math
 import os
 import random
@@ -89,6 +90,7 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    stats_memory_every = int(os.environ.get("STATS_MEMORY_EVERY", 100))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -923,6 +925,12 @@ def main() -> None:
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    cuda_device_count = torch.cuda.device_count()
+    if local_rank >= cuda_device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} but only {cuda_device_count} CUDA devices are visible. "
+            f"Use --nproc_per_node <= {cuda_device_count} or fix CUDA_VISIBLE_DEVICES."
+        )
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
@@ -1068,8 +1076,13 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    local_microbatch_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(
+        f"batch_config:global_tokens:{args.train_batch_tokens} local_microbatch_tokens:{local_microbatch_tokens} "
+        f"train_seq_len:{args.train_seq_len}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"attention_residual:{args.attention_residual} attn_res_block_size:{args.attn_res_block_size} "
@@ -1169,6 +1182,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        step_wall_start = time.perf_counter()
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1195,6 +1209,8 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        step_wall_ms = 1000.0 * (time.perf_counter() - step_wall_start)
+        tokens_per_sec = args.train_batch_tokens / max(step_wall_ms / 1000.0, 1e-9)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1215,9 +1231,28 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            mem_alloc_mib = torch.cuda.memory_allocated() // 1024 // 1024
+            mem_reserved_mib = torch.cuda.memory_reserved() // 1024 // 1024
+            max_mem_alloc_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
+            max_mem_reserved_mib = torch.cuda.max_memory_reserved() // 1024 // 1024
+            current_tok_lr = optimizer_tok.param_groups[0]["lr"]
+            current_scalar_lr = optimizer_scalar.param_groups[0]["lr"]
+            current_muon_lr = optimizer_muon.param_groups[0]["lr"]
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"step_ms:{step_wall_ms:.2f} tok_s:{tokens_per_sec:.0f} "
+                f"lr_tok:{current_tok_lr:.5f} lr_muon:{current_muon_lr:.5f} lr_scalar:{current_scalar_lr:.5f} "
+                f"muon_momentum:{muon_momentum:.4f} "
+                f"mem_alloc:{mem_alloc_mib}MiB mem_reserved:{mem_reserved_mib}MiB "
+                f"mem_peak_alloc:{max_mem_alloc_mib}MiB mem_peak_reserved:{max_mem_reserved_mib}MiB"
+            )
+        elif args.stats_memory_every > 0 and step % args.stats_memory_every == 0:
+            log0(
+                f"step:{step}/{args.iterations} stats_only "
+                f"step_ms:{step_wall_ms:.2f} tok_s:{tokens_per_sec:.0f} "
+                f"mem_alloc:{torch.cuda.memory_allocated() // 1024 // 1024}MiB "
+                f"mem_reserved:{torch.cuda.memory_reserved() // 1024 // 1024}MiB"
             )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1270,13 +1305,16 @@ def main() -> None:
         quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
     else:
         quant_blob = zlib.compress(quant_raw, 9)
+    quant_file_bytes = 0
+    total_submission_bytes = 0
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
+        total_submission_bytes = quant_file_bytes + code_bytes
         log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+zlib: {total_submission_bytes} bytes")
 
     if distributed:
         dist.barrier()
@@ -1312,6 +1350,34 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(
+        f"competition_score:{q_val_bpb:.8f} competition_metric:val_bpb "
+        f"artifact_bytes:{total_submission_bytes}"
+    )
+    if master_process:
+        result = {
+            "run_id": args.run_id,
+            "competition_metric": "val_bpb",
+            "competition_score": float(q_val_bpb),
+            "val_loss": float(q_val_loss),
+            "artifact_bytes": int(total_submission_bytes),
+            "compressed_model_bytes": int(quant_file_bytes),
+            "code_bytes": int(len(code.encode('utf-8'))),
+            "eval_mode": "sliding_window" if args.eval_stride > 0 and args.eval_stride < args.train_seq_len else "standard",
+            "eval_stride": int(args.eval_stride),
+            "eval_batch_seqs": int(args.eval_batch_seqs),
+            "num_layers": int(args.num_layers),
+            "model_dim": int(args.model_dim),
+            "num_heads": int(args.num_heads),
+            "num_kv_heads": int(args.num_kv_heads),
+            "mlp_mult": float(args.mlp_mult),
+            "attention_residual": bool(args.attention_residual),
+            "attn_res_block_size": int(args.attn_res_block_size),
+        }
+        with open("competition_result.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, sort_keys=True)
+            f.write("\n")
+        log0("competition_result_file:competition_result.json")
 
     if distributed:
         dist.destroy_process_group()
