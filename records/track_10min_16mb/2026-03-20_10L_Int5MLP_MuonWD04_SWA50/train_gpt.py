@@ -58,14 +58,18 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    num_layers = int(os.environ.get("NUM_LAYERS", 16))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 3))
+    model_dim = int(os.environ.get("MODEL_DIM", 384))
+    num_heads = int(os.environ.get("NUM_HEADS", 6))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    attention_residual = bool(int(os.environ.get("ATTENTION_RESIDUAL", "1")))
+    attn_res_block_size = int(os.environ.get("ATTN_RES_BLOCK_SIZE", 2))
+    attn_res_current_bias_init = float(os.environ.get("ATTN_RES_CURRENT_BIAS_INIT", 2.0))
+    attn_res_mix_init = float(os.environ.get("ATTN_RES_MIX_INIT", 0.25))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -276,13 +280,13 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,attn_res",
     ).split(",")
     if pattern
 )
 FP16_KEEP_NAME_PATTERNS = tuple(
     pattern
-    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.8.attn.c_k").split(",")
+    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb").split(",")
     if pattern
 )
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
@@ -611,8 +615,56 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+class LayerAttentionResidual(nn.Module):
+    def __init__(self, dim: int, current_bias_init: float, mix_init: float):
+        super().__init__()
+        if not 0.0 <= mix_init <= 1.0:
+            raise ValueError(f"ATTN_RES_MIX_INIT must be in [0, 1], got {mix_init}")
+        self.norm = RMSNorm()
+        self.attn_res_query = nn.Parameter(torch.randn(dim, dtype=torch.float32) / math.sqrt(dim))
+        self.attn_res_current_bias = nn.Parameter(torch.tensor(current_bias_init, dtype=torch.float32))
+        if mix_init <= 0.0:
+            mix_logit_init = -20.0
+        elif mix_init >= 1.0:
+            mix_logit_init = 20.0
+        else:
+            mix_logit_init = math.log(mix_init / (1.0 - mix_init))
+        self.attn_res_mix_logit = nn.Parameter(torch.full((dim,), mix_logit_init, dtype=torch.float32))
+
+    def forward(self, x: Tensor, history: list[Tensor]) -> Tensor:
+        candidates = history + [x]
+        if len(candidates) == 1:
+            return x
+        q = self.attn_res_query.to(dtype=x.dtype)
+        logits = torch.stack(
+            [
+                torch.einsum("d,btd->bt", q, self.norm(candidate)) / math.sqrt(x.size(-1))
+                for candidate in candidates
+            ],
+            dim=0,
+        )
+        logits[-1] = logits[-1] + self.attn_res_current_bias.to(dtype=logits.dtype)
+        weights = logits.softmax(dim=0)
+        mixed = torch.zeros_like(x)
+        for weight, candidate in zip(weights.unbind(0), candidates, strict=True):
+            mixed = mixed + weight[..., None].to(dtype=x.dtype) * candidate
+        mix = torch.sigmoid(self.attn_res_mix_logit.to(dtype=x.dtype))[None, None, :]
+        return x + mix * (mixed - x)
+
+
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: float,
+        rope_base: float,
+        qk_gain_init: float,
+        use_attention_residual: bool,
+        attn_res_current_bias_init: float,
+        attn_res_mix_init: float,
+    ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -620,14 +672,32 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attn_res = (
+            LayerAttentionResidual(dim, attn_res_current_bias_init, attn_res_mix_init)
+            if use_attention_residual
+            else None
+        )
+        self.mlp_res = (
+            LayerAttentionResidual(dim, attn_res_current_bias_init, attn_res_mix_init)
+            if use_attention_residual
+            else None
+        )
+        self.resid_mix = (
+            None if use_attention_residual else nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        )
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+    def forward(self, x: Tensor, x0: Tensor, history: list[Tensor]) -> Tensor:
+        if self.attn_res is None or self.mlp_res is None:
+            if self.resid_mix is None:
+                raise RuntimeError("resid_mix is required when attention residuals are disabled")
+            mix = self.resid_mix.to(dtype=x.dtype)
+            attn_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        else:
+            attn_in = self.attn_res(x, history)
+        attn_out = self.attn(self.attn_norm(attn_in))
+        x = attn_in + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_in = x if self.mlp_res is None else self.mlp_res(x, history)
+        x = mlp_in + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(mlp_in))
         return x
 
 
@@ -647,13 +717,21 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        attention_residual: bool = True,
+        attn_res_block_size: int = 2,
+        attn_res_current_bias_init: float = 2.0,
+        attn_res_mix_init: float = 0.25,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if attn_res_block_size <= 0:
+            raise ValueError(f"ATTN_RES_BLOCK_SIZE must be positive, got {attn_res_block_size}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.attention_residual = attention_residual
+        self.attn_res_block_size = attn_res_block_size
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.num_encoder_layers = num_layers // 2
@@ -663,7 +741,17 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                    attention_residual,
+                    attn_res_current_bias_init,
+                    attn_res_mix_init,
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -688,20 +776,7 @@ class GPT(nn.Module):
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
-        x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self._forward_backbone(input_ids)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -714,26 +789,35 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
+        x = self.final_norm(self._forward_backbone(input_ids))
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def _forward_backbone(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
+        history = [x0]
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, history)
             skips.append(x)
+            if self.attention_residual and (i + 1) % self.attn_res_block_size == 0:
+                history.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        x = self.final_norm(x)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+            layer_idx = self.num_encoder_layers + i
+            x = self.blocks[layer_idx](x, x0, history)
+            if self.attention_residual and (layer_idx + 1) % self.attn_res_block_size == 0:
+                history.append(x)
+        return x
 
 
 def eval_val_sliding(
@@ -916,6 +1000,10 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        attention_residual=args.attention_residual,
+        attn_res_block_size=args.attn_res_block_size,
+        attn_res_current_bias_init=args.attn_res_current_bias_init,
+        attn_res_mix_init=args.attn_res_mix_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -983,6 +1071,10 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"attention_residual:{args.attention_residual} attn_res_block_size:{args.attn_res_block_size} "
+        f"attn_res_current_bias_init:{args.attn_res_current_bias_init} attn_res_mix_init:{args.attn_res_mix_init}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"

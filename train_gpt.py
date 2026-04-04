@@ -31,8 +31,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 # Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - 18 transformer blocks at width 384
+# - 6 attention heads with 3 KV heads (GQA) and 2x MLP expansion
+# - Kimi-style layer-history attention residuals every 2 layers
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
@@ -61,14 +62,18 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 18))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 3))
+    model_dim = int(os.environ.get("MODEL_DIM", 384))
+    num_heads = int(os.environ.get("NUM_HEADS", 6))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    attention_residual = bool(int(os.environ.get("ATTENTION_RESIDUAL", "1")))
+    attn_res_block_size = int(os.environ.get("ATTN_RES_BLOCK_SIZE", 2))
+    attn_res_current_bias_init = float(os.environ.get("ATTN_RES_CURRENT_BIAS_INIT", 2.0))
+    attn_res_mix_init = float(os.environ.get("ATTN_RES_MIX_INIT", 0.25))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -289,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_res",
     ).split(",")
     if pattern
 )
@@ -617,6 +622,43 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class LayerAttentionResidual(nn.Module):
+    def __init__(self, dim: int, current_bias_init: float, mix_init: float):
+        super().__init__()
+        if not 0.0 <= mix_init <= 1.0:
+            raise ValueError(f"ATTN_RES_MIX_INIT must be in [0, 1], got {mix_init}")
+        self.norm = RMSNorm()
+        self.attn_res_query = nn.Parameter(torch.randn(dim, dtype=torch.float32) / math.sqrt(dim))
+        self.attn_res_current_bias = nn.Parameter(torch.tensor(current_bias_init, dtype=torch.float32))
+        if mix_init <= 0.0:
+            mix_logit_init = -20.0
+        elif mix_init >= 1.0:
+            mix_logit_init = 20.0
+        else:
+            mix_logit_init = math.log(mix_init / (1.0 - mix_init))
+        self.attn_res_mix_logit = nn.Parameter(torch.full((dim,), mix_logit_init, dtype=torch.float32))
+
+    def forward(self, x: Tensor, history: list[Tensor]) -> Tensor:
+        candidates = history + [x]
+        if len(candidates) == 1:
+            return x
+        q = self.attn_res_query.to(dtype=x.dtype)
+        logits = torch.stack(
+            [
+                torch.einsum("d,btd->bt", q, self.norm(candidate)) / math.sqrt(x.size(-1))
+                for candidate in candidates
+            ],
+            dim=0,
+        )
+        logits[-1] = logits[-1] + self.attn_res_current_bias.to(dtype=logits.dtype)
+        weights = logits.softmax(dim=0)
+        mixed = torch.zeros_like(x)
+        for weight, candidate in zip(weights.unbind(0), candidates, strict=True):
+            mixed = mixed + weight[..., None].to(dtype=x.dtype) * candidate
+        mix = torch.sigmoid(self.attn_res_mix_logit.to(dtype=x.dtype))[None, None, :]
+        return x + mix * (mixed - x)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -626,6 +668,9 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_attention_residual: bool,
+        attn_res_current_bias_init: float,
+        attn_res_mix_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -634,14 +679,32 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attn_res = (
+            LayerAttentionResidual(dim, attn_res_current_bias_init, attn_res_mix_init)
+            if use_attention_residual
+            else None
+        )
+        self.mlp_res = (
+            LayerAttentionResidual(dim, attn_res_current_bias_init, attn_res_mix_init)
+            if use_attention_residual
+            else None
+        )
+        self.resid_mix = (
+            None if use_attention_residual else nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        )
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+    def forward(self, x: Tensor, x0: Tensor, history: list[Tensor]) -> Tensor:
+        if self.attn_res is None or self.mlp_res is None:
+            if self.resid_mix is None:
+                raise RuntimeError("resid_mix is required when attention residuals are disabled")
+            mix = self.resid_mix.to(dtype=x.dtype)
+            attn_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        else:
+            attn_in = self.attn_res(x, history)
+        attn_out = self.attn(self.attn_norm(attn_in))
+        x = attn_in + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_in = x if self.mlp_res is None else self.mlp_res(x, history)
+        x = mlp_in + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(mlp_in))
         return x
 
 
@@ -659,13 +722,21 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attention_residual: bool,
+        attn_res_block_size: int,
+        attn_res_current_bias_init: float,
+        attn_res_mix_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if attn_res_block_size <= 0:
+            raise ValueError(f"ATTN_RES_BLOCK_SIZE must be positive, got {attn_res_block_size}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.attention_residual = attention_residual
+        self.attn_res_block_size = attn_res_block_size
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,6 +751,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attention_residual,
+                    attn_res_current_bias_init,
+                    attn_res_mix_init,
                 )
                 for i in range(num_layers)
             ]
@@ -701,16 +775,22 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        history = [x0]
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, history)
             skips.append(x)
+            if self.attention_residual and (i + 1) % self.attn_res_block_size == 0:
+                history.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            x = self.blocks[layer_idx](x, x0, history)
+            if self.attention_residual and (layer_idx + 1) % self.attn_res_block_size == 0:
+                history.append(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,6 +915,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attention_residual=args.attention_residual,
+        attn_res_block_size=args.attn_res_block_size,
+        attn_res_current_bias_init=args.attn_res_current_bias_init,
+        attn_res_mix_init=args.attn_res_mix_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -897,6 +981,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"attention_residual:{args.attention_residual} attn_res_block_size:{args.attn_res_block_size} "
+        f"attn_res_current_bias_init:{args.attn_res_current_bias_init} attn_res_mix_init:{args.attn_res_mix_init}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
