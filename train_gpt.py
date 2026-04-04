@@ -548,7 +548,13 @@ class Rotary(nn.Module):
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        cos = self._cos_cached.to(dtype=dtype)
+        sin = self._sin_cached.to(dtype=dtype)
+        if cos.is_inference():
+            cos = cos.clone()
+        if sin.is_inference():
+            sin = sin.clone()
+        return cos, sin
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:

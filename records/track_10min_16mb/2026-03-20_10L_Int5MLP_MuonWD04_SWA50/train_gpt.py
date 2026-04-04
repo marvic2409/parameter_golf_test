@@ -53,10 +53,12 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    compile_enabled = bool(int(os.environ.get("COMPILE", "1")))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    grad_accum_steps_override = int(os.environ.get("GRAD_ACCUM_STEPS_OVERRIDE", 0))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 16))
@@ -516,7 +518,13 @@ class Rotary(nn.Module):
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        cos = self._cos_cached.to(dtype=dtype)
+        sin = self._sin_cached.to(dtype=dtype)
+        if cos.is_inference():
+            cos = cos.clone()
+        if sin.is_inference():
+            sin = sin.clone()
+        return cos, sin
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -911,7 +919,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.compile_enabled:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -919,9 +928,12 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if args.grad_accum_steps_override > 0:
+        grad_accum_steps = args.grad_accum_steps_override
+    else:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+        grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1017,7 +1029,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.compile_enabled else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
@@ -1079,6 +1091,7 @@ def main() -> None:
     local_microbatch_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"compile_enabled:{args.compile_enabled}")
     log0(
         f"batch_config:global_tokens:{args.train_batch_tokens} local_microbatch_tokens:{local_microbatch_tokens} "
         f"train_seq_len:{args.train_seq_len}"
@@ -1185,14 +1198,21 @@ def main() -> None:
         step_wall_start = time.perf_counter()
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        batch_fetch_ms = 0.0
+        fwd_bwd_ms = 0.0
+        opt_ms = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            t_fetch = time.perf_counter()
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            batch_fetch_ms += 1000.0 * (time.perf_counter() - t_fetch)
+            t_fwd_bwd = time.perf_counter()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            fwd_bwd_ms += 1000.0 * (time.perf_counter() - t_fwd_bwd)
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1204,11 +1224,13 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
+        t_opt = time.perf_counter()
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        opt_ms += 1000.0 * (time.perf_counter() - t_opt)
         step_wall_ms = 1000.0 * (time.perf_counter() - step_wall_start)
         tokens_per_sec = args.train_batch_tokens / max(step_wall_ms / 1000.0, 1e-9)
 
@@ -1242,6 +1264,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
                 f"step_ms:{step_wall_ms:.2f} tok_s:{tokens_per_sec:.0f} "
+                f"fetch_ms:{batch_fetch_ms:.2f} fwd_bwd_ms:{fwd_bwd_ms:.2f} opt_ms:{opt_ms:.2f} "
                 f"lr_tok:{current_tok_lr:.5f} lr_muon:{current_muon_lr:.5f} lr_scalar:{current_scalar_lr:.5f} "
                 f"muon_momentum:{muon_momentum:.4f} "
                 f"mem_alloc:{mem_alloc_mib}MiB mem_reserved:{mem_reserved_mib}MiB "
@@ -1251,6 +1274,7 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} stats_only "
                 f"step_ms:{step_wall_ms:.2f} tok_s:{tokens_per_sec:.0f} "
+                f"fetch_ms:{batch_fetch_ms:.2f} fwd_bwd_ms:{fwd_bwd_ms:.2f} opt_ms:{opt_ms:.2f} "
                 f"mem_alloc:{torch.cuda.memory_allocated() // 1024 // 1024}MiB "
                 f"mem_reserved:{torch.cuda.memory_reserved() // 1024 // 1024}MiB"
             )
